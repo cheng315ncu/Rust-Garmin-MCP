@@ -476,6 +476,4 @@ The original Python implementation established the tool taxonomy, endpoint mappi
 
 ---
 
-## License
 
-MIT
