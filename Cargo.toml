@@ -1,0 +1,22 @@
+[package]
+name = "garmin-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "garmin-mcp"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "1", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+garmin_client = "0.2"
+schemars = { version = "0.8", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
+moka = { version = "0.12", features = ["future"] }
+governor = "0.6"
+dotenvy = "0.15"
+chrono = "0.4"

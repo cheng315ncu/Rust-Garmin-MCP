@@ -1,0 +1,33 @@
+# Build artifacts
+/target/
+/PRESENTATION.pptx
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.envrc
+.direnv/
+.garmin_email
+.garmin_password
+.garmin_email.*
+.garmin_password.*
+.garmin_session.json
+.garmin_session*.json
+
+# Local assistant / editor state
+.claude/
+.cursor/
+.vscode/
+.idea/
+
+# OS / local temp files
+.DS_Store
+*.log
+*.tmp
+*.db
+*.sqlite
+*.sqlite3
+
+# Local notes
+dev/dev.md
