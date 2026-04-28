@@ -77,7 +77,7 @@ jobs:
         run: |
           $assetName = "${env:BINARY_NAME}-${env:GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive_ext }}"
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath $assetName
-          "ASSET_NAME=$assetName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Add-Content -Path $env:GITHUB_ENV -Value "ASSET_NAME=$assetName"
 
       - name: Upload asset to release
         env:
