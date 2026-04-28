@@ -1,6 +1,9 @@
 # Build artifacts
 /target/
+/PRESENTATION.html
 /PRESENTATION.pptx
+/build_pptx.py
+/speach.md
 
 # Local environment and secrets
 .env
