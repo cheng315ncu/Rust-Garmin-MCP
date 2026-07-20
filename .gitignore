@@ -1,5 +1,8 @@
 # Build artifacts
 /target/
+# Nested crates build too; /target/ only anchors at the repo root.
+vendor/*/target/
+vendor/*/Cargo.lock
 /PRESENTATION.html
 /PRESENTATION.pptx
 /build_pptx.py

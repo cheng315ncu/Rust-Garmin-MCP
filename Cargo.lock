@@ -118,6 +118,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base32"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "022dfe9eb35f19ebbcb51e0b40a5ab759f46ad60cadf7297e0bd085afb50e076"
+
+[[package]]
 name = "base64"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -784,10 +790,10 @@ dependencies = [
 [[package]]
 name = "garmin_client"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32ca34c089ba9a8aea73ebdcf575dab30976f6d8cd86774593f6d53cdd79a8fd"
 dependencies = [
+ "base32",
  "chrono",
+ "hmac 0.12.1",
  "hyper-rustls",
  "log",
  "log4rs",
@@ -796,6 +802,7 @@ dependencies = [
  "reqwest-oauth1",
  "serde",
  "serde_json",
+ "sha1",
  "tokio",
  "url",
  "url-builder",

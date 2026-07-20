@@ -1,0 +1,36 @@
+# Vendored fork of garmin_client 0.2.1 (GPL-3.0),
+# https://github.com/poster515/Rust-Garmin/
+#
+# Forked for one reason: upstream reads the MFA code from stdin, which is
+# unusable under MCP because stdin carries the JSON-RPC transport. See
+# `handle_mfa` in src/lib.rs for the change.
+[package]
+name = "garmin_client"
+version = "0.2.1"
+edition = "2021"
+license = "GPL-3.0"
+description = "Provides an oauth2.0-capable client that interfaces with Garmin (vendored, MFA patched)"
+rust-version = "1.70"
+repository = "https://github.com/poster515/Rust-Garmin/"
+keywords = ["garmin", "fitness", "client", "oauth2"]
+publish = false
+
+[dependencies]
+serde_json = "1.0.111"
+url = "2.5.0"
+url-builder = "0.1.1"
+tokio = { version = "1.35.1", features = ["full"] }
+log = "0.4.20"
+log4rs = "1.2.0"
+regex = "1.10.2"
+hyper-rustls = "0.27.3"
+reqwest = { version = "0.12.9", features = ["blocking", "cookies", "multipart", "json"] }
+reqwest-oauth1 = "0.3.0"
+zip = "2.2.1"
+chrono = "0.4.31"
+serde = "1.0.195"
+
+# Added by the fork, for non-interactive TOTP generation (RFC 6238).
+hmac = "0.12"
+sha1 = "0.10"
+base32 = "0.5"
