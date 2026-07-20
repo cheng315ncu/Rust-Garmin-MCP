@@ -476,4 +476,16 @@ The original Python implementation established the tool taxonomy, endpoint mappi
 
 ---
 
+## Licensing
+
+**GPL-3.0.**
+
+This project links [`garmin_client`](https://github.com/poster515/Rust-Garmin/), which is GPL-3.0. Apache-2.0 and GPL-3.0 are compatible in one direction only — Apache-2.0 code may be incorporated into a GPL-3.0 work, not the reverse — so a distributed work that includes `garmin_client` is GPL-3.0.
+
+Earlier commits declared Apache-2.0. That was inaccurate: the obligation came from the dependency and applied from the moment it was added, not from any later change. The declaration has been corrected rather than the situation.
+
+A patched copy of `garmin_client` 0.2.1 lives in [`vendor/garmin_client/`](vendor/garmin_client/) under its own GPL-3.0 terms — see [`vendor/garmin_client/VENDORED.md`](vendor/garmin_client/VENDORED.md) for what changed and why.
+
+---
+
 
