@@ -49,7 +49,9 @@ impl BearerToken {
 ///
 /// GET path layers (outermost → innermost):
 ///
-///     moka cache  →  governor rate-limit  →  Mutex<GarminClient>  →  Garmin
+/// ```text
+/// moka cache  →  governor rate-limit  →  Mutex<GarminClient>  →  Garmin
+/// ```
 ///
 ///   * Cache hit  → return Arc<Value> immediately; no Mutex, no network.
 ///   * Cache miss → moka's singleflight: only one task fetches, the rest

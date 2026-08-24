@@ -1,7 +1,4 @@
-mod auth;
-mod client;
-mod tools;
-
+use garmin_mcp::auth;
 use rmcp::{transport::stdio, ServiceExt};
 
 #[tokio::main]

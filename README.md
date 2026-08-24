@@ -382,20 +382,25 @@ All tools accept JSON arguments. Clinical tools also accept an optional `"format
 
 ---
 
-## Smoke Test
+## Connection Test
 
-`dev/smoke.sh` runs a minimal MCP session via stdin/stdout against the real binary:
+`tests/connection.rs` performs a real OAuth login against Garmin Connect using
+the same code path as `main.rs`. It's `#[ignore]`d by default (it hits the
+network and needs real credentials), so it never runs during normal `cargo
+test` / CI — run it explicitly to verify your setup:
 
 ```bash
 # Credentials from .env (simplest)
-DATE=2026-04-24 bash dev/smoke.sh
+cargo test --test connection -- --ignored --nocapture
 
 # Or pass inline
-DATE=2026-04-24 GARMIN_EMAIL=you@example.com GARMIN_PASSWORD=secret bash dev/smoke.sh
-
-# Server stderr (auth progress, API logs) → /tmp/garmin-mcp.err
-# MCP JSON-RPC responses → stdout
+GARMIN_EMAIL=you@example.com GARMIN_PASSWORD=secret \
+  cargo test --test connection -- --ignored --nocapture
 ```
+
+A successful run prints `Logged in as: <handle>` (or a warning if the display
+name couldn't be resolved); a failure panics with the underlying error, e.g.
+bad credentials or a Garmin API change.
 
 ---
 
@@ -403,7 +408,8 @@ DATE=2026-04-24 GARMIN_EMAIL=you@example.com GARMIN_PASSWORD=secret bash dev/smo
 
 ```
 src/
-├── main.rs          — startup: load .env, OAuth, stdio transport
+├── main.rs          — thin binary entrypoint: load .env, OAuth, stdio transport
+├── lib.rs           — library root (pub mod auth/client/tools), used by main.rs and tests/
 ├── auth.rs          — OAuth login, display-name resolution, session file read
 ├── client.rs        — GarminApiClient (cache + rate-limit + three-layer sync)
 └── tools/
