@@ -19,6 +19,7 @@
 .garmin_session*.json
 .di_session.json
 .di_session*.json
+.mfa_code.txt
 
 # Local assistant / editor state
 .claude/

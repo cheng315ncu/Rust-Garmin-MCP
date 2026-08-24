@@ -17,7 +17,7 @@ const SSO_HOST: &str = "sso.garmin.com";
 const DI_TOKEN_URL: &str = "https://diauth.garmin.com/di-oauth2-service/oauth/token";
 const DI_GRANT_TYPE: &str =
     "https://connectapi.garmin.com/di-oauth2-service/oauth/grant/service_ticket";
-const SERVICE_URL: &str = "https://mobile.integration.garmin.com/gcm/android";
+const SERVICE_URL: &str = "https://sso.garmin.com/sso/embed";
 const SESSION_FILE: &str = ".di_session.json";
 
 /// DI client IDs to try in order during ticket exchange (rotated quarterly).
@@ -59,6 +59,11 @@ impl DiSession {
 pub struct SsoLoginResult {
     pub needs_mfa: bool,
     pub ticket: Option<String>,
+    /// CSRF token extracted from the MFA page (when `needs_mfa` is true).
+    pub mfa_csrf: Option<String>,
+    /// The MFA page URL (with query params) — the form has no `action`
+    /// attribute, so it submits back to this URL.
+    pub mfa_url: Option<String>,
 }
 
 fn now_secs() -> u64 {
@@ -102,7 +107,11 @@ pub fn build_impersonated_client() -> Result<rquest::Client> {
                 .build(),
         )
         .cookie_store(true)
-        .user_agent(USER_AGENT);
+        .user_agent(USER_AGENT)
+        .redirect(rquest::redirect::Policy::limited(10))
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(5)))
+        .pool_max_idle_per_host(0)
+        .timeout(std::time::Duration::from_secs(30));
 
     if let Some(store) = system_cert_store() {
         builder = builder.cert_store(store);
@@ -115,7 +124,8 @@ pub fn build_impersonated_client() -> Result<rquest::Client> {
 }
 
 /// Sign-in page query params. Garmin's embed widget expects every redirect
-/// field to point back at the embed host.
+/// field to point back at the embed host. The `service` parameter is
+/// overridden by the server to match `gauthHost`/`redirectAfterAccountLoginUrl`.
 fn signin_query_params() -> Vec<(&'static str, &'static str)> {
     let embed = "https://sso.garmin.com/sso/embed";
     vec![
@@ -154,9 +164,10 @@ fn extract_csrf(html: &str) -> Result<String> {
     Ok(cap)
 }
 
-/// Extract the service ticket from an embed HTML page.
+/// Extract the service ticket from an embed/success page. The ticket appears
+/// in a `response_url` JavaScript variable as `...?ticket=ST-...`.
 fn extract_ticket(html: &str) -> Result<String> {
-    let re = Regex::new(r#"embed\?ticket=([^"&]+)"#).context("invalid ticket regex")?;
+    let re = Regex::new(r#"[?&]ticket=([^"&]+)"#).context("invalid ticket regex")?;
     let cap = re
         .captures(html)
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
@@ -222,6 +233,7 @@ pub async fn sso_login(
         .send()
         .await
         .with_context(|| format!("signin POST {url} failed"))?;
+    let post_url = resp.url().to_string();
     let body = resp
         .text()
         .await
@@ -231,9 +243,12 @@ pub async fn sso_login(
 
     // 4. MFA required?
     if title.contains("MFA") {
+        let csrf = extract_csrf(&body).ok();
         return Ok(SsoLoginResult {
             needs_mfa: true,
             ticket: None,
+            mfa_csrf: csrf,
+            mfa_url: Some(post_url),
         });
     }
 
@@ -250,52 +265,57 @@ pub async fn sso_login(
     Ok(SsoLoginResult {
         needs_mfa: false,
         ticket: Some(ticket),
+        mfa_csrf: None,
+        mfa_url: None,
     })
 }
 
 /// Submit the MFA code and return the resulting service ticket.
-pub async fn submit_mfa(client: &rquest::Client, mfa_code: &str) -> Result<String> {
-    // 1. Fresh CSRF token from the sign-in page.
-    let url = signin_url();
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("signin page GET {url} failed"))?;
-    let signin_html = resp
-        .text()
-        .await
-        .with_context(|| format!("signin page body read {url} failed"))?;
-    let csrf = extract_csrf(&signin_html)?;
-
-    // 2. POST the (trimmed!) MFA code.
+///
+/// `csrf` is the CSRF token extracted from the MFA page (passed in from
+/// `sso_login`) — we do NOT re-GET the signin page here because the session
+/// is already in the MFA state and a fresh GET may fail or return a
+/// different page.
+///
+/// `mfa_url` is the MFA page URL (with query params). The form has no
+/// `action` attribute, so it submits back to the same URL.
+pub async fn submit_mfa(
+    client: &rquest::Client,
+    mfa_code: &str,
+    csrf: &str,
+    mfa_url: &str,
+) -> Result<String> {
+    // 1. POST the (trimmed!) MFA code with the CSRF from the MFA page.
     let form = [
         ("mfa-code", mfa_code.trim().to_string()),
         ("fromPage", "setupEnterMfaCode".to_string()),
         ("embed", "true".to_string()),
-        ("_csrf", csrf),
+        ("_csrf", csrf.to_string()),
     ];
-    let verify_url = format!("https://{SSO_HOST}/sso/verifyMFA/loginEnterMfaCode");
     let resp = client
-        .post(&verify_url)
+        .post(mfa_url)
         .form(&form)
         .send()
         .await
-        .with_context(|| format!("MFA verify POST {verify_url} failed"))?;
+        .with_context(|| format!("MFA verify POST {mfa_url} failed"))?;
     let body = resp
         .text()
         .await
-        .with_context(|| format!("MFA verify body read {verify_url} failed"))?;
+        .with_context(|| format!("MFA verify body read {mfa_url} failed"))?;
 
     let title = extract_title(&body).unwrap_or_default();
     if title != "Success" {
         bail!("Garmin MFA verification failed (page title: {title:?})");
     }
 
-    // 3. Cloudflare LB cookie.
-    let embed_html = portal_embed_body(client).await?;
+    // 2. Try to extract the ticket from the MFA POST response body first.
+    //    The Success page contains `response_url = "...?ticket=ST-..."`.
+    if let Ok(ticket) = extract_ticket(&body) {
+        return Ok(ticket);
+    }
 
-    // 4. Parse the ticket.
+    // 3. Fall back: get the Cloudflare LB cookie + embed page.
+    let embed_html = portal_embed_body(client).await?;
     extract_ticket(&embed_html)
 }
 
@@ -469,11 +489,32 @@ pub fn read_secret(env_key: &str, file_key: &str) -> Result<String> {
     bail!("{env_key} or {file_key} environment variable is required")
 }
 
-/// Read the MFA code from `GARMIN_MFA_CODE` env, otherwise from stdin.
+/// Read the MFA code from `GARMIN_MFA_CODE` env, a file pointed to by
+/// `GARMIN_MFA_CODE_FILE` (polled for non-interactive/agent runs), or stdin.
 pub fn read_mfa_code() -> Result<String> {
     if let Ok(val) = std::env::var("GARMIN_MFA_CODE") {
         return Ok(val.trim().to_string());
     }
+
+    // File-based fallback with polling: lets an external agent inject the
+    // MFA code into a running test by writing it to a file (stdin is not
+    // reachable when the test is spawned in the background).
+    if let Ok(path) = std::env::var("GARMIN_MFA_CODE_FILE") {
+        eprintln!("[di_auth] waiting for MFA code in file: {path}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let code = content.trim();
+                if !code.is_empty() {
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(code.to_string());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        bail!("timed out waiting for MFA code in {path}");
+    }
+
     eprintln!("MFA code required: enter it and press Enter:");
     let mut input = String::new();
     std::io::stdin()
@@ -515,9 +556,18 @@ pub async fn authenticate() -> Result<DiSession> {
         let ticket = ticket.trim();
         if !ticket.is_empty() {
             eprintln!("[di_auth] exchanging GARMIN_SERVICE_TICKET for DI session...");
-            let session = exchange_service_ticket(ticket).await?;
-            save_session(&session)?;
-            return Ok(session);
+            match exchange_service_ticket(ticket).await {
+                Ok(session) => {
+                    save_session(&session)?;
+                    return Ok(session);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[di_auth] service ticket exchange failed ({e:#}); \
+                         falling through to email/password login"
+                    );
+                }
+            }
         }
     }
 
@@ -532,7 +582,13 @@ pub async fn authenticate() -> Result<DiSession> {
     let ticket = if result.needs_mfa {
         eprintln!("[di_auth] MFA required.");
         let code = read_mfa_code()?;
-        submit_mfa(&client, &code).await?
+        let csrf = result
+            .mfa_csrf
+            .context("MFA required but no CSRF token was extracted from the MFA page")?;
+        let mfa_url = result
+            .mfa_url
+            .context("MFA required but no MFA page URL was captured")?;
+        submit_mfa(&client, &code, &csrf, &mfa_url).await?
     } else {
         result
             .ticket
