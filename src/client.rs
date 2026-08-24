@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use anyhow::Result;
-use garmin_client::GarminClient;
+use anyhow::{Context, Result};
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
@@ -12,63 +11,43 @@ use governor::{
 };
 use moka::future::Cache;
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
-const API_BASE: &str = "https://connectapi.garmin.com";
+use crate::di_auth::{self, DiSession};
+
+pub const API_BASE: &str = "https://connectapi.garmin.com";
 
 /// Max cached GET responses (LRU-evicted past this).
 const CACHE_MAX_ENTRIES: u64 = 1_000;
-/// TTL for cached GET responses.  60s coalesces "LLM re-asks the same
-/// question in the same conversation" without hiding fresh wearable data
-/// for long.  Tune via observation if researchers report stale reads.
+/// TTL for cached GET responses. 60s coalesces "LLM re-asks the same
+/// question in the same conversation" without hiding fresh wearable data.
 const CACHE_TTL_SECS: u64 = 60;
-/// Per-minute request budget against Garmin Connect.  Garmin does not
-/// document a hard limit; 60 req/min is a conservative starting point.
-/// Adjust by observation if tools begin failing with 429.
+/// Per-minute request budget against Garmin Connect. 60 req/min is a
+/// conservative starting point. Adjust if tools begin failing with 429.
 const RATE_LIMIT_PER_MIN: u32 = 60;
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
-/// Holds a bearer token together with its expiry epoch (seconds).
-struct BearerToken {
-    value: String,
-    expires_at: u64,
-}
-
-impl BearerToken {
-    fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now >= self.expires_at.saturating_sub(60) // 60-second safety margin
-    }
-}
-
 /// Shared Garmin API session.
 ///
-/// GET path layers (outermost → innermost):
+/// GET path layers (outermost -> innermost):
 ///
 /// ```text
-/// moka cache  →  governor rate-limit  →  Mutex<GarminClient>  →  Garmin
+/// moka cache  ->  governor rate-limit  ->  rquest GET  ->  Garmin
 /// ```
 ///
-///   * Cache hit  → return Arc<Value> immediately; no Mutex, no network.
-///   * Cache miss → moka's singleflight: only one task fetches, the rest
-///     await the same future.  After the rate-limit wait, the Mutex
-///     serialises the actual GarminClient call (the library is not
-///     Send-safe and api_request takes &mut).
-///   * Rate limit → applied to BOTH read and write paths so the per-minute
-///     budget covers all Garmin-bound traffic.
+///   * Cache hit  -> return Arc<Value> immediately; no network.
+///   * Cache miss -> moka's singleflight: only one task fetches, the rest
+///     await the same future.  After the rate-limit wait, the rquest GET
+///     carries the DI OAuth2 bearer token.
 ///
-/// Token (parallel to the above) lives behind Arc<RwLock<BearerToken>>:
-/// concurrent reads for the write path, exclusive refresh.  garmin_client
-/// only exposes GET, so POST/PUT/DELETE go through reqwest directly using
-/// the cached bearer token.
+/// Token lives behind `Arc<RwLock<DiSession>>`: concurrent reads for the
+/// request path, exclusive refresh when the access token nears expiry.
+/// The DI refresh token (~30 day lifetime) auto-renews the access token and
+/// the new session is persisted to `.di_session.json`.
 pub struct GarminApiClient {
-    inner: Arc<Mutex<GarminClient>>,
-    http: reqwest::Client,
-    token: Arc<RwLock<BearerToken>>,
+    http: rquest::Client,
+    token: Arc<RwLock<DiSession>>,
     pub display_name: String,
     /// Key: `endpoint?k1=v1&k2=v2` (params sorted).  Value: Arc<Value> so
     /// cache reads are Arc-bumps instead of full JSON deep-clones.
@@ -78,12 +57,7 @@ pub struct GarminApiClient {
 }
 
 impl GarminApiClient {
-    pub fn new(
-        client: GarminClient,
-        display_name: String,
-        bearer_token: String,
-        token_expires_at: u64,
-    ) -> Self {
+    pub fn new(session: DiSession, display_name: String) -> Self {
         let cache = Cache::builder()
             .max_capacity(CACHE_MAX_ENTRIES)
             .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
@@ -94,22 +68,16 @@ impl GarminApiClient {
         )));
 
         Self {
-            inner: Arc::new(Mutex::new(client)),
-            http: reqwest::Client::builder()
-                .cookie_store(true) // mirror garmin_client behaviour
-                .build()
-                .expect("reqwest::Client build failed"),
-            token: Arc::new(RwLock::new(BearerToken {
-                value: bearer_token,
-                expires_at: token_expires_at,
-            })),
+            http: di_auth::build_impersonated_client()
+                .expect("rquest impersonated client build failed"),
+            token: Arc::new(RwLock::new(session)),
             display_name,
             cache,
             limiter,
         }
     }
 
-    /// GET via garmin_client with TTL cache + singleflight + rate limit.
+    /// GET via rquest with TTL cache + singleflight + rate limit.
     ///
     /// Repeated calls within `CACHE_TTL_SECS` for the same (endpoint, params)
     /// return the cached Value without hitting Garmin.  Concurrent callers
@@ -121,8 +89,9 @@ impl GarminApiClient {
     ) -> Result<Value> {
         let key = build_cache_key(endpoint, params.as_ref());
 
-        // Clone Arc handles so the init future is 'static (moka requirement).
-        let inner = self.inner.clone();
+        // Clone handles so the init future is 'static (moka requirement).
+        let http = self.http.clone();
+        let token = self.token.clone();
         let limiter = self.limiter.clone();
         let endpoint_owned = endpoint.trim_start_matches('/').to_string();
         let params_owned = params;
@@ -131,24 +100,42 @@ impl GarminApiClient {
             // Rate limit gates the actual network call; cache hits skip this.
             limiter.until_ready().await;
 
-            let mut guard = inner.lock().await;
+            // Refresh the DI access token if it is about to expire.
+            ensure_token_fresh(token.clone()).await;
 
-            let ok = match params_owned.as_ref() {
-                Some(p) => {
-                    let p_ref: HashMap<&str, &str> =
-                        p.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    guard
-                        .api_request(&endpoint_owned, Some(p_ref), true, None)
-                        .await
-                }
-                None => guard.api_request(&endpoint_owned, None, true, None).await,
-            };
+            let guard = token.read().await;
+            let auth_header = format!("Bearer {}", guard.access_token);
+            drop(guard); // release read lock before the network call
 
-            let text = guard.get_last_resp_text().to_string();
-            drop(guard); // release Mutex before parsing
+            let url = format!("{}/{}", API_BASE, endpoint_owned);
+            let mut req = http
+                .get(&url)
+                .header("Authorization", auth_header)
+                .header("NK", "NT")
+                .header("X-app-ver", "4.70.2.0")
+                .header("Accept", "application/json");
 
-            if !ok {
-                anyhow::bail!("Garmin API GET to {} failed", endpoint_owned);
+            if let Some(p) = params_owned.as_ref() {
+                req = req.query(&p);
+            }
+
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Garmin API GET {url} failed"))?;
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .with_context(|| format!("Garmin API GET {url} body read failed"))?;
+
+            if !status.is_success() {
+                anyhow::bail!(
+                    "Garmin API GET to {} failed: {} {}",
+                    endpoint_owned,
+                    status,
+                    preview(&text)
+                );
             }
 
             if text.is_empty() {
@@ -194,12 +181,11 @@ impl GarminApiClient {
         self.api_write("DELETE", endpoint, None).await
     }
 
-    /// POST / PUT / DELETE via reqwest (garmin_client is GET-only).
+    /// POST / PUT / DELETE via rquest.
     ///
     /// On success, invalidates the entire GET cache so the next read sees
     /// post-write state.  Per-key invalidation would be ideal but
-    /// write-endpoint → affected-read-endpoints is messy (e.g. POST /weight
-    /// affects /weight-service/weight/dateRange) and writes are rare.
+    /// write-endpoint -> affected-read-endpoints is messy and writes are rare.
     async fn api_write(&self, method: &str, endpoint: &str, body: Option<Value>) -> Result<Value> {
         // Writes count against the same per-minute budget as reads.
         self.limiter.until_ready().await;
@@ -207,7 +193,7 @@ impl GarminApiClient {
         self.refresh_token_if_needed().await;
 
         let token = self.token.read().await;
-        let auth_header = format!("Bearer {}", token.value);
+        let auth_header = format!("Bearer {}", token.access_token);
         drop(token); // release read lock before the network call
 
         let endpoint = endpoint.trim_start_matches('/');
@@ -240,7 +226,7 @@ impl GarminApiClient {
                 method,
                 endpoint,
                 status,
-                &text[..text.len().min(200)]
+                preview(&text)
             );
         }
 
@@ -256,49 +242,15 @@ impl GarminApiClient {
                 "parse error at {} {}: {e}; body: {}",
                 method,
                 endpoint,
-                &text[..text.len().min(200)]
+                preview(&text)
             )
         })
     }
 
-    /// Refresh the cached bearer token when it is about to expire.
-    ///
-    /// Limitation (unchanged): garmin_client does NOT rewrite the session
-    /// file after an in-process refresh — only on login.  Until upstream
-    /// fixes that, this only helps after a server restart.  Long-lived
-    /// daemons still die at the ~1-hour token lifetime.
+    /// Refresh the DI access token when it is about to expire, using the
+    /// refresh token, and persist the new session.
     async fn refresh_token_if_needed(&self) {
-        // Fast path: read lock — token is still valid.
-        {
-            let guard = self.token.read().await;
-            if !guard.is_expired() {
-                return;
-            }
-        }
-
-        // Slow path: upgrade to write lock (only one task proceeds).
-        let mut guard = self.token.write().await;
-
-        // Re-check under write lock.
-        if !guard.is_expired() {
-            return;
-        }
-
-        // Trigger garmin_client's internal OAuth refresh via a cheap GET.
-        {
-            let mut inner = self.inner.lock().await;
-            inner
-                .api_request("userprofile-service/userprofile", None, true, None)
-                .await;
-        }
-
-        if let Ok((new_token, new_exp)) = read_session_file() {
-            eprintln!("[client] bearer token refreshed (expires_at={new_exp})");
-            guard.value = new_token;
-            guard.expires_at = new_exp;
-        } else {
-            eprintln!("[client] warning: token expired but could not re-read session file");
-        }
+        ensure_token_fresh(self.token.clone()).await;
     }
 
     pub fn require_display_name(&self) -> std::result::Result<&str, String> {
@@ -310,10 +262,54 @@ impl GarminApiClient {
     }
 }
 
+/// Free-function twin of `refresh_token_if_needed` usable from the 'static
+/// moka init future (which cannot borrow `&self`).  Double-checked locking:
+/// fast path takes a read lock, slow path upgrades to a write lock and
+/// re-checks so only one task performs the refresh.
+async fn ensure_token_fresh(token: Arc<RwLock<DiSession>>) {
+    // Fast path: read lock — token is still valid.
+    {
+        let guard = token.read().await;
+        if !guard.is_expired() {
+            return;
+        }
+    }
+
+    // Slow path: upgrade to write lock (only one task proceeds).
+    let mut guard = token.write().await;
+
+    // Re-check under write lock.
+    if !guard.is_expired() {
+        return;
+    }
+
+    if !guard.refresh_is_valid() {
+        eprintln!(
+            "[client] warning: access token expired and refresh token no longer valid; re-login needed"
+        );
+        return;
+    }
+
+    match di_auth::refresh_di_token(&guard).await {
+        Ok(new_session) => {
+            eprintln!(
+                "[client] DI access token refreshed (expires_at={})",
+                new_session.expires_at
+            );
+            let _ = di_auth::save_session(&new_session);
+            *guard = new_session;
+        }
+        Err(e) => {
+            eprintln!("[client] warning: DI token refresh failed: {e}");
+        }
+    }
+}
+
+fn preview(text: &str) -> String {
+    text.chars().take(200).collect()
+}
+
 /// Build a stable cache key from `endpoint` + sorted params.
-///
-/// HashMap iteration order is unspecified, so two identical calls would
-/// otherwise produce different keys and miss each other in the cache.
 fn build_cache_key(endpoint: &str, params: Option<&HashMap<String, String>>) -> String {
     let ep = endpoint.trim_start_matches('/');
     match params {
@@ -323,42 +319,16 @@ fn build_cache_key(endpoint: &str, params: Option<&HashMap<String, String>>) -> 
             let mut entries: Vec<(&str, &str)> =
                 p.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             entries.sort_by_key(|(k, _)| *k);
-            let qs: Vec<String> = entries
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
+            let qs: Vec<String> = entries.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             format!("{}?{}", ep, qs.join("&"))
         }
     }
 }
 
-/// Read (token_value, expires_at) from .garmin_session.json.
-/// Uses `.as_str()` — NOT `.to_string()` — to avoid garmin_client's
-/// re-quoting bug where the JWT becomes `"eyJ..."` (with quotes).
-pub fn read_session_file() -> Result<(String, u64)> {
-    let text = std::fs::read_to_string(".garmin_session.json")?;
-    let map: serde_json::Value = serde_json::from_str(&text)?;
-
-    let token = map["token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("token field missing in session file"))?
-        .to_string();
-
-    let expires_at = map["expires_at"]
-        .as_str()
-        .and_then(|s| s.parse::<u64>().ok())
-        .or_else(|| map["expires_at"].as_u64())
-        .unwrap_or(0);
-
-    Ok((token, expires_at))
-}
-
 /// Detect Garmin error envelopes that parsed as JSON (403/404/etc with body).
-/// Returns Some(short_message) when the value looks like an error envelope.
 pub fn detect_garmin_error(value: &Value) -> Option<String> {
     let obj = value.as_object()?;
 
-    // {status: 403, error: "Forbidden", message: "..."}
     if let Some(status) = obj.get("status").and_then(Value::as_u64) {
         if (400..600).contains(&status) {
             let kind = obj
@@ -374,7 +344,6 @@ pub fn detect_garmin_error(value: &Value) -> Option<String> {
         }
     }
 
-    // {exception: "ForbiddenException", ...}
     if let Some(exc) = obj.get("exception").and_then(Value::as_str) {
         let msg = obj
             .get("errorMessage")
@@ -388,8 +357,6 @@ pub fn detect_garmin_error(value: &Value) -> Option<String> {
         });
     }
 
-    // {error: "NotAllowedException", clientMessage: "...", errorId: "..."}
-    // Garmin uses this shape when the account doesn't have access to a feature.
     if let Some(err) = obj.get("error").and_then(Value::as_str) {
         if err.ends_with("Exception") || obj.contains_key("errorId") {
             let hint = obj
@@ -405,7 +372,6 @@ pub fn detect_garmin_error(value: &Value) -> Option<String> {
         }
     }
 
-    // {errorMessage: "..."}（no status / exception field）
     if let Some(msg) = obj.get("errorMessage").and_then(Value::as_str) {
         return Some(msg.to_string());
     }
