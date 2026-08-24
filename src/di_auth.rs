@@ -68,11 +68,33 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Load the system CA certificate bundle so that rquest (BoringSSL) trusts
+/// the same root CAs as the host OS.  This is essential in environments
+/// where a proxy, VPN, or corporate firewall intercepts HTTPS with its own
+/// CA — BoringSSL's built-in webpki roots won't include that CA, but the
+/// system bundle (`/etc/ssl/certs/ca-certificates.crt` on Debian/Ubuntu)
+/// does.
+fn system_cert_store() -> Option<rquest::tls::CertStore> {
+    const CA_PATHS: &[&str] = &[
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/Fedora
+        "/etc/ssl/cert.pem",                  // macOS / Alpine
+    ];
+    for path in CA_PATHS {
+        if let Ok(store) = rquest::tls::CertStore::from_pem_file(path) {
+            eprintln!("[di_auth] loaded system CA bundle from {path}");
+            return Some(store);
+        }
+    }
+    eprintln!("[di_auth] warning: no system CA bundle found; TLS verification may fail behind proxies/VPNs");
+    None
+}
+
 /// Build an `rquest::Client` impersonating Chrome 131 on Android with a
 /// persistent cookie store, so cookies (including Cloudflare's `__cflb`)
 /// are shared across the whole SSO + DI token-exchange flow.
 pub fn build_impersonated_client() -> Result<rquest::Client> {
-    let client = rquest::Client::builder()
+    let mut builder = rquest::Client::builder()
         .emulation(
             EmulationOption::builder()
                 .emulation(Emulation::Chrome131)
@@ -80,7 +102,13 @@ pub fn build_impersonated_client() -> Result<rquest::Client> {
                 .build(),
         )
         .cookie_store(true)
-        .user_agent(USER_AGENT)
+        .user_agent(USER_AGENT);
+
+    if let Some(store) = system_cert_store() {
+        builder = builder.cert_store(store);
+    }
+
+    let client = builder
         .build()
         .context("failed to build rquest impersonated client")?;
     Ok(client)
@@ -274,14 +302,24 @@ pub async fn submit_mfa(client: &rquest::Client, mfa_code: &str) -> Result<Strin
 /// Exchange a service ticket for a DI OAuth2 session. Tries each client ID
 /// in turn until one succeeds.
 pub async fn exchange_service_ticket(ticket: &str) -> Result<DiSession> {
-    let client = build_impersonated_client()?;
+    // The DI token endpoint is a standard OAuth2 endpoint on diauth.garmin.com.
+    // It does NOT need TLS fingerprint impersonation (unlike sso.garmin.com which
+    // is behind Cloudflare).  Using a plain rquest client avoids potential TLS
+    // handshake issues caused by Chrome emulation on this endpoint.
+    let mut builder = rquest::Client::builder().cookie_store(true);
+    if let Some(store) = system_cert_store() {
+        builder = builder.cert_store(store);
+    }
+    let client = builder
+        .build()
+        .context("failed to build plain rquest client for DI exchange")?;
 
     let mut last_err: Option<anyhow::Error> = None;
     for &client_id in DI_CLIENT_IDS {
         match try_exchange(&client, client_id, ticket).await {
             Ok(session) => return Ok(session),
             Err(e) => {
-                eprintln!("[di_auth] ticket exchange with {client_id} failed: {e}");
+                eprintln!("[di_auth] ticket exchange with {client_id} failed: {e:#}");
                 last_err = Some(e);
             }
         }
@@ -305,6 +343,8 @@ async fn try_exchange(
     let resp = client
         .post(DI_TOKEN_URL)
         .header("Authorization", format!("Basic {basic}"))
+        .header("Accept", "application/json,text/html;q=0.9,*/*;q=0.8")
+        .header("Cache-Control", "no-cache")
         .form(&form)
         .send()
         .await
@@ -325,7 +365,13 @@ async fn try_exchange(
 
 /// Refresh an expired access token using the refresh token.
 pub async fn refresh_di_token(session: &DiSession) -> Result<DiSession> {
-    let client = build_impersonated_client()?;
+    let mut builder = rquest::Client::builder().cookie_store(true);
+    if let Some(store) = system_cert_store() {
+        builder = builder.cert_store(store);
+    }
+    let client = builder
+        .build()
+        .context("failed to build plain rquest client for DI refresh")?;
     let basic = STANDARD.encode(format!("{}:", session.client_id));
     let form = [
         ("client_id", session.client_id.clone()),
@@ -336,6 +382,8 @@ pub async fn refresh_di_token(session: &DiSession) -> Result<DiSession> {
     let resp = client
         .post(DI_TOKEN_URL)
         .header("Authorization", format!("Basic {basic}"))
+        .header("Accept", "application/json,text/html;q=0.9,*/*;q=0.8")
+        .header("Cache-Control", "no-cache")
         .form(&form)
         .send()
         .await
