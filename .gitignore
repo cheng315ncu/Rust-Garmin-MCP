@@ -17,6 +17,8 @@
 .garmin_password.*
 .garmin_session.json
 .garmin_session*.json
+.di_session.json
+.di_session*.json
 
 # Local assistant / editor state
 .claude/
