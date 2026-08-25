@@ -77,6 +77,19 @@ TLS-impersonation crate.
   caused by Garmin's March 2026 Cloudflare TLS-fingerprinting rollout.
 - MFA code trailing-newline bug from the old `garmin_client` handler (codes are
   now trimmed).
+- **The account gate could fail open.** An unreadable `GARMIN_EMAIL_FILE` — a
+  secrets mount that is not ready yet, say — collapsed to "no account
+  configured", which is the value that means "nothing can contradict the cached
+  session". It is an error now.
+- **MFA required with no code available no longer reads stdin blindly.** The
+  server speaks MCP over stdio, so prompting there consumes protocol traffic;
+  it prompts only on a real terminal and otherwise says which variable to set.
+- **A rejected MFA code is cleared from `GARMIN_MFA_CODE_FILE`.** Codes are
+  single-use, so keeping the file after a failed submission made every
+  subsequent run read the same dead code back.
+- **A refreshed token that is already expired no longer clears the backoff**,
+  which would otherwise turn the next request into another refresh — a hot loop
+  against Garmin's auth endpoint.
 - **`sso_login` failures now name the reason.** The page title is the same on a
   rejected sign-in as on a successful one, so a failure reported only
   `page title: "GARMIN Authentication Application"`. The visible error banner is

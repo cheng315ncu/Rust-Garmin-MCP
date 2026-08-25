@@ -354,17 +354,32 @@ async fn ensure_token_fresh(token: Arc<RwLock<DiSession>>, refresh: Arc<Mutex<Re
     // Note the absence of any lock guard across this await.
     match di_auth::refresh_di_token(&session).await {
         Ok(new_session) => {
-            eprintln!(
-                "[client] DI access token refreshed (expires_at={})",
-                new_session.expires_at
-            );
+            let expires_at = new_session.expires_at;
+            // A token that is already inside the 60s expiry margin would leave
+            // `is_expired()` true, so clearing the throttle here would turn the
+            // next request straight back into another refresh — a hot loop
+            // against Garmin's auth endpoint.
+            let still_expired = new_session.is_expired();
+
+            eprintln!("[client] DI access token refreshed (expires_at={expires_at})");
             if let Err(e) = di_auth::save_session(&new_session) {
                 eprintln!("[client] warning: could not persist refreshed session: {e:#}");
             }
             *token.write().await = new_session;
-            state.next_attempt = None;
-            state.failures = 0;
-            state.reported_dead = false;
+
+            if still_expired {
+                state.failures = state.failures.saturating_add(1);
+                let backoff = refresh_backoff(state.failures);
+                state.next_attempt = Some(Instant::now() + backoff);
+                eprintln!(
+                    "[client] warning: refreshed token is already expired (expires_at={expires_at}); next attempt in {}s",
+                    backoff.as_secs()
+                );
+            } else {
+                state.next_attempt = None;
+                state.failures = 0;
+                state.reported_dead = false;
+            }
         }
         Err(e) => {
             state.failures = state.failures.saturating_add(1);

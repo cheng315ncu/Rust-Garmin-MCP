@@ -3,6 +3,7 @@
 //! Replaces the deprecated `garmin_client` (garth-based) SSO flow that broke
 //! when Garmin enabled Cloudflare TLS fingerprinting in March 2026.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -263,8 +264,10 @@ static TICKET_RE: LazyLock<Regex> =
 /// — and "An unexpected error has occurred." — Garmin rejected the request
 /// itself, so look at headers and fingerprint, not credentials.
 static STATUS_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)<div[^>]*id=["']status["'][^>]*class=["'][^"']*error[^"']*["'][^>]*>(.*?)</div>"#)
-        .expect("valid status error regex")
+    Regex::new(
+        r#"(?is)<div[^>]*id=["']status["'][^>]*class=["'][^"']*error[^"']*["'][^>]*>(.*?)</div>"#,
+    )
+    .expect("valid status error regex")
 });
 
 fn extract_status_error(html: &str) -> Option<String> {
@@ -746,6 +749,16 @@ pub fn read_mfa_code() -> Result<String> {
         bail!("timed out waiting for MFA code in {path}");
     }
 
+    // `main.rs` serves MCP over stdio, so stdin there is the protocol channel:
+    // reading a line would consume client traffic and hang the session. Only
+    // prompt when stdin is a real terminal.
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "MFA required but stdin is not a terminal (it is the MCP protocol channel); \
+             set GARMIN_MFA_CODE, or GARMIN_MFA_CODE_FILE to a path this process can poll"
+        );
+    }
+
     eprintln!("MFA code required: enter it and press Enter:");
     let mut input = String::new();
     std::io::stdin()
@@ -754,11 +767,12 @@ pub fn read_mfa_code() -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-/// Remove the injected MFA code file once the code has been accepted.
+/// Remove the injected MFA code file once its code has been submitted.
 ///
-/// Deleting it at read time throws away a still-valid code whenever the POST
-/// fails, leaving no way to retry — and destroys whatever file the user pointed
-/// the variable at, even a persistent one.
+/// Deleting it at *read* time throws away a still-valid code if the request
+/// never reaches Garmin; keeping it after a *rejected* submission wedges every
+/// later run on a dead code. Deleting it once submitted is the only point where
+/// the code is definitely spent.
 fn clear_mfa_code_file() {
     if let Some(path) = non_empty_env("GARMIN_MFA_CODE_FILE") {
         let _ = std::fs::remove_file(path);
@@ -766,14 +780,31 @@ fn clear_mfa_code_file() {
 }
 
 /// The account a cached session must belong to: `GARMIN_EMAIL` (or its `_FILE`
-/// variant), lowercased.  `None` when neither is set — e.g. a
+/// variant), lowercased.
+///
+/// `Ok(None)` means genuinely nothing is configured — e.g. a
 /// `GARMIN_SERVICE_TICKET`-only deployment, where there is nothing to compare
-/// against.
-fn configured_account() -> Option<String> {
-    read_secret("GARMIN_EMAIL", "GARMIN_EMAIL_FILE")
-        .ok()
-        .map(|email| email.trim().to_lowercase())
-        .filter(|email| !email.is_empty())
+/// against.  An unreadable or empty `GARMIN_EMAIL_FILE` is an error rather than
+/// `None`: `session_matches_account` treats "nothing configured" as "nothing can
+/// contradict the cache", so collapsing an I/O failure into `None` would make
+/// the gate fail *open*.  A secrets mount that isn't ready yet is exactly the
+/// case where that would silently reuse someone else's session.
+fn configured_account() -> Result<Option<String>> {
+    if let Some(email) = non_empty_env("GARMIN_EMAIL") {
+        return Ok(Some(email.to_lowercase()));
+    }
+
+    let Some(path) = non_empty_env("GARMIN_EMAIL_FILE") else {
+        return Ok(None);
+    };
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("GARMIN_EMAIL_FILE points at {path}, which could not be read"))?;
+    let email = content.trim();
+    if email.is_empty() {
+        bail!("GARMIN_EMAIL_FILE points at {path}, which is empty");
+    }
+    Ok(Some(email.to_lowercase()))
 }
 
 /// A cached session may only be reused when it was minted for the account this
@@ -813,7 +844,7 @@ fn session_matches_account(session: &DiSession, want: Option<&str>) -> bool {
 /// cookies earned here (Cloudflare's `__cflb` in particular) are the same ones
 /// the API layer later sends.
 pub async fn authenticate(client: &rquest::Client) -> Result<DiSession> {
-    let want_account = configured_account();
+    let want_account = configured_account()?;
 
     // Layer 1: cached session, but only if it belongs to the configured account.
     if let Ok(session) = load_session() {
@@ -881,9 +912,13 @@ pub async fn authenticate(client: &rquest::Client) -> Result<DiSession> {
         let mfa_url = result
             .mfa_url
             .context("MFA required but no MFA page URL was captured")?;
-        let ticket = submit_mfa(client, &code, &csrf, &mfa_url).await?;
+        let submitted = submit_mfa(client, &code, &csrf, &mfa_url).await;
+        // Clear the injected file whether or not Garmin accepted it: an MFA
+        // code is single-use, so it is spent the moment it is submitted.
+        // Keeping it on failure means the next run reads the dead code straight
+        // back and fails identically, forever.
         clear_mfa_code_file();
-        ticket
+        submitted?
     } else {
         result
             .ticket
@@ -909,6 +944,48 @@ mod tests {
             refresh_expires_at,
             client_id: "CID".into(),
             account: Some("alice@example.com".into()),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_email_file_is_an_error_not_an_absent_account() {
+        // These variables are process-global; this is the only test that
+        // touches them, and it restores whatever it found.
+        let saved = (
+            std::env::var("GARMIN_EMAIL").ok(),
+            std::env::var("GARMIN_EMAIL_FILE").ok(),
+        );
+        std::env::remove_var("GARMIN_EMAIL");
+        std::env::remove_var("GARMIN_EMAIL_FILE");
+
+        // Nothing configured: a GARMIN_SERVICE_TICKET-only deployment has no
+        // account to compare a cached session against.
+        assert!(matches!(configured_account(), Ok(None)));
+
+        // Configured but unreadable must NOT collapse to Ok(None) — that is the
+        // value session_matches_account reads as "nothing can contradict the
+        // cache", so it would make the gate fail open.
+        std::env::set_var("GARMIN_EMAIL_FILE", "/nonexistent/garmin-email");
+        assert!(configured_account().is_err());
+
+        // An empty file is a placeholder, not an account.
+        std::env::set_var("GARMIN_EMAIL", "   ");
+        assert!(configured_account().is_err());
+
+        // A direct value wins over the file, and is normalised.
+        std::env::set_var("GARMIN_EMAIL", "Alice@Example.COM");
+        assert_eq!(
+            configured_account().unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+
+        std::env::remove_var("GARMIN_EMAIL");
+        std::env::remove_var("GARMIN_EMAIL_FILE");
+        if let Some(v) = saved.0 {
+            std::env::set_var("GARMIN_EMAIL", v);
+        }
+        if let Some(v) = saved.1 {
+            std::env::set_var("GARMIN_EMAIL_FILE", v);
         }
     }
 
