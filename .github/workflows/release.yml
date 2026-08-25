@@ -55,6 +55,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # rquest -> boring-sys2 compiles BoringSSL from source. Its CMakeLists
+      # does enable_language(ASM_NASM) on x86/x86_64 Windows, and NASM is not
+      # on the windows runner image. Not needed before v0.2.0, when the HTTP
+      # stack was still reqwest/rustls.
+      - name: Install NASM (BoringSSL assembly on Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
