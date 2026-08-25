@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::client::{self, GarminApiClient};
 use crate::di_auth;
+use crate::tools::user_profile;
 use crate::tools::GarminMcpServer;
 
 pub async fn create_garmin_client() -> Result<GarminApiClient> {
@@ -38,9 +39,13 @@ async fn resolve_display_name(client: &rquest::Client, access_token: &str) -> St
         return name;
     }
 
+    // socialProfile first — it is the only one of the three that answers today
+    // (the other two 404, confirmed live; see src/tools/user_profile.rs). They
+    // stay as fallbacks in case Garmin restores them, but probing them first
+    // spent a guaranteed-404 Cloudflare round-trip on every process start.
     let endpoints = [
+        user_profile::SOCIAL_PROFILE,
         "/userprofile-service/userprofile/v2/information",
-        "/userprofile-service/socialProfile",
         "/userprofile-service/userprofile",
     ];
 

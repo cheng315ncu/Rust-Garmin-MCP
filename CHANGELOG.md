@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The four `user_profile` tools were calling dead Garmin endpoints** and could
+  only ever return HTTP 404s. `get_user_profile` and `get_full_name` now read
+  `/userprofile-service/socialProfile`; `get_userprofile_settings` and
+  `get_unit_system` now read `/userprofile-service/userprofile/settings`. Both
+  paths are confirmed live. **The `get_userprofile_settings` response shape
+  changed**: it returns locale/measurement/date-format preferences, not the
+  privacy fields the old path implied — profile privacy is now part of
+  `get_user_profile`. The two tools' MCP descriptions were updated to match.
+- All four tools now render through `render_or_friendly` / `detect_garmin_error`
+  instead of printing the raw error chain, and report a missing `fullName` /
+  `measurementSystem` field rather than emitting `""` / `null` for it — the
+  silent-degradation path that let the dead endpoints ship unnoticed.
+- `resolve_display_name` probes `socialProfile` first instead of last, dropping a
+  guaranteed-404 Cloudflare round-trip from every process start.
+
+### Added
+
+- `docs/DATA_SCHEMA.md`: response-shape reference for all 77 tools, written from
+  real responses captured on a live account.
+- `tests/schema_dump.rs`: `#[ignore]`d live harness that dumps every read-only
+  tool's output to `SCHEMA_DUMP_DIR`, for regenerating that reference. Refuses an
+  in-repo output directory and writes each file 0600 — the dumps hold real GPS,
+  heart-rate and identity data.
+
 ## [0.2.0] - 2026-08-25
 
 In March 2026 Garmin enabled Cloudflare TLS fingerprinting on `sso.garmin.com`

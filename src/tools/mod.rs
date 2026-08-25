@@ -613,12 +613,16 @@ impl GarminMcpServer {
 
     // ---- User Profile ----
 
-    #[tool(description = "Get the user's full Garmin profile information")]
+    #[tool(
+        description = "Get the user's Garmin social profile: display name, full name, account email, profile id, and profile privacy/visibility settings"
+    )]
     async fn get_user_profile(&self) -> String {
         user_profile::get_user_profile(&self.api).await
     }
 
-    #[tool(description = "Get the user's profile settings (privacy, language, etc.)")]
+    #[tool(
+        description = "Get the user's locale and formatting preferences: measurement system, number/date/time format, preferred locale, time zone, hydration units. Profile privacy settings are in get_user_profile instead"
+    )]
     async fn get_userprofile_settings(&self) -> String {
         user_profile::get_userprofile_settings(&self.api).await
     }

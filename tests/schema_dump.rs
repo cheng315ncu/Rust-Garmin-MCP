@@ -2,7 +2,8 @@
 //! schema reference can be written from real responses instead of guessed
 //! shapes. Ignored by default since it hits the real network — run
 //! explicitly with an output directory (outside the repo — the dumped
-//! files contain real personal health data and must never be committed):
+//! files contain real personal health data and must never be committed; an
+//! in-repo path is rejected at startup, and each file is written 0600):
 //!
 //!   SCHEMA_DUMP_DIR=/path/to/dir cargo test --test schema_dump -- --ignored --nocapture
 //!
@@ -14,7 +15,7 @@
 use std::fs;
 use std::path::Path;
 
-use chrono::{Duration, Local};
+use chrono::{Days, Local};
 use garmin_mcp::auth::create_garmin_client;
 use garmin_mcp::tools::output::OutputFormat;
 use garmin_mcp::tools::{
@@ -26,6 +27,15 @@ use serde_json::Value;
 fn save(dir: &Path, domain: &str, tool: &str, content: &str) {
     let path = dir.join(format!("{domain}__{tool}.txt"));
     fs::write(&path, content).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+    // GPS traces, HRV series, device serials and the account email — same
+    // sensitivity as .di_session.json, so the same 0600, not the 0644 a default
+    // umask would leave behind.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|e| panic!("chmod {path:?}: {e}"));
+    }
     println!("[dump] {domain}::{tool} -> {} bytes", content.len());
 }
 
@@ -41,18 +51,21 @@ fn find_first_id(v: &Value, keys: &[&str]) -> Option<String> {
         match v {
             Value::Object(map) => {
                 for k in keys {
-                    if let Some(found) = map.get(*k) {
-                        if !found.is_null() {
-                            return Some(match found {
-                                Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            });
-                        }
+                    // Scalars only: the result is interpolated into a URL path,
+                    // and a nested object under an `id` key would serialize to
+                    // `{"a":1}` and produce a malformed request.
+                    match map.get(*k) {
+                        Some(Value::String(s)) => return Some(s.clone()),
+                        Some(n @ Value::Number(_)) => return Some(n.to_string()),
+                        _ => {}
                     }
                 }
                 map.values().find_map(|val| walk(val, keys, depth + 1))
             }
-            Value::Array(arr) => arr.first().and_then(|first| walk(first, keys, depth + 1)),
+            // Every element, not just the first — one leading entry without the
+            // key (a paired phone in the device list, say) would otherwise skip
+            // a whole domain of the dump and look like "the account has none".
+            Value::Array(arr) => arr.iter().find_map(|e| walk(e, keys, depth + 1)),
             _ => None,
         }
     }
@@ -68,24 +81,40 @@ async fn dump_all_read_tool_schemas() {
         std::env::var("SCHEMA_DUMP_DIR").expect("set SCHEMA_DUMP_DIR to an out-of-repo path"),
     );
     fs::create_dir_all(&out_dir).expect("create output dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o700)).expect("chmod output dir");
+    }
+
+    // cargo runs integration tests with the package root as cwd, so a relative
+    // SCHEMA_DUMP_DIR lands in the working tree. .gitignore cannot cover an
+    // arbitrary path, and these files hold real health data — refuse outright
+    // rather than trusting the caller to have read the module doc.
+    let repo = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("canonicalize repo root");
+    let resolved = fs::canonicalize(&out_dir).expect("canonicalize SCHEMA_DUMP_DIR");
+    assert!(
+        !resolved.starts_with(&repo),
+        "SCHEMA_DUMP_DIR ({}) is inside the repo ({}). The dump contains real GPS, heart-rate \
+         and identity data — point it somewhere outside the working tree.",
+        resolved.display(),
+        repo.display(),
+    );
 
     let api = create_garmin_client()
         .await
         .expect("Failed to create authenticated Garmin API client");
 
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let yesterday = (Local::now() - Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
-    let d10 = (Local::now() - Duration::days(10))
-        .format("%Y-%m-%d")
-        .to_string();
-    let d30 = (Local::now() - Duration::days(30))
-        .format("%Y-%m-%d")
-        .to_string();
-    let plus30 = (Local::now() + Duration::days(30))
-        .format("%Y-%m-%d")
-        .to_string();
+    // One `now`, derived with calendar arithmetic: five separate Local::now()
+    // calls disagree across midnight, and `- Duration::days(n)` subtracts fixed
+    // 24h spans that shift the local date across a DST boundary.
+    let today_date = Local::now().date_naive();
+    let day = |n: u64| (today_date - Days::new(n)).to_string();
+    let today = today_date.to_string();
+    let yesterday = day(1);
+    let d10 = day(10);
+    let d30 = day(30);
+    let plus30 = (today_date + Days::new(30)).to_string();
 
     // ----- resolve dependency ids first -----
 

@@ -17,10 +17,19 @@ cargo fmt
 
 cargo test                     # unit tests (SSO parsers, session logic, cache key)
 
-# The integration test hits the real network and is #[ignore]d, so `cargo test`
-# compiles but skips it. Run it explicitly:
+# Two integration tests hit the real network and are #[ignore]d, so `cargo test`
+# compiles but skips them. Run them explicitly:
 cargo test --test connection -- --ignored --nocapture
+
+# Live schema dump: writes every read-only tool's real output to SCHEMA_DUMP_DIR,
+# which is required and must be OUTSIDE the repo (the test asserts this — the
+# files hold real GPS/HRV/identity data). Source for docs/DATA_SCHEMA.md.
+SCHEMA_DUMP_DIR=~/garmin-dump cargo test --test schema_dump -- --ignored --nocapture
 ```
+
+`docs/DATA_SCHEMA.md` is the response-shape reference for all 77 tools, captured from a live
+account — check it before hand-deriving a payload shape. Its per-tool status column also records
+which endpoints are account-gated versus actually broken.
 
 ### Cold-build toolchain (BoringSSL)
 

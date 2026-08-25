@@ -408,6 +408,20 @@ A successful run prints `Logged in as: <handle>` (or a warning if the display
 name couldn't be resolved); a failure panics with the underlying error, e.g.
 bad credentials or a Garmin API change.
 
+### Schema dump
+
+`tests/schema_dump.rs` is a second `#[ignore]`d live test. It calls every
+read-only tool once and writes each result to a file, which is how
+[`docs/DATA_SCHEMA.md`](docs/DATA_SCHEMA.md) — the response-shape reference for
+all 77 tools — was written. `SCHEMA_DUMP_DIR` is required and must point
+**outside the repository**; the dumped files contain real GPS traces,
+heart-rate series, device serials and your account email, so an in-repo path is
+rejected and every file is written `0600`.
+
+```bash
+SCHEMA_DUMP_DIR=~/garmin-dump cargo test --test schema_dump -- --ignored --nocapture
+```
+
 ---
 
 ## Architecture
@@ -434,6 +448,13 @@ src/
     ├── womens_health.rs —  3 tools
     ├── nutrition.rs     —  3 tools
     └── data_management.rs —  3 tools (POST)
+
+tests/
+├── connection.rs    — live OAuth login smoke test (#[ignore]d)
+└── schema_dump.rs   — live dump of every read-only tool (#[ignore]d)
+
+docs/
+└── DATA_SCHEMA.md   — observed response shapes for all 77 tools
 ```
 
 ### GET pipeline (`client.rs`)
