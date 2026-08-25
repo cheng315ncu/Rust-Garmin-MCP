@@ -41,3 +41,9 @@ AGENTS.md
 
 # Local notes
 dev/dev.md
+
+# Live schema-dump output (tests/schema_dump.rs). The test refuses an in-repo
+# SCHEMA_DUMP_DIR, so this is only a second line of defence for the obvious names.
+/schema_dump/
+/schema-dump/
+/dump/
