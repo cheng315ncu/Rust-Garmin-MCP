@@ -26,6 +26,10 @@
 .cursor/
 .vscode/
 .idea/
+.codegraph/
+# Auto-maintained agent memory: host-specific paths and personal working
+# preferences, not project documentation. Shared guidance goes in CLAUDE.md.
+AGENTS.md
 
 # OS / local temp files
 .DS_Store

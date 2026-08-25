@@ -25,10 +25,19 @@ cargo test --test connection -- --ignored --nocapture
 ### Cold-build toolchain (BoringSSL)
 
 `rquest` pulls in `boring-sys2`, which compiles BoringSSL from source and runs bindgen. A fresh
-clone or post-`cargo clean` build needs `cmake`, `go`, and `libclang` on this aarch64/WSL2 host
-(no sudo/apt — tools live under `~/.local/opt/`). See `AGENTS.md` for the exact
-`PATH` / `LIBCLANG_PATH` / `BINDGEN_EXTRA_CLANG_ARGS` values. Incremental builds against a warm
-`target/` do not need them, so `cargo check` succeeding is not evidence a cold build will.
+clone or post-`cargo clean` build needs `cmake`, `go`, and `libclang`. Incremental builds against a
+warm `target/` do not need them, so `cargo check` succeeding is not evidence a cold build will.
+
+On the original aarch64/WSL2 host there is no sudo/apt, so these live under `~/.local/opt/` and the
+build needs:
+
+```bash
+export PATH="$HOME/.local/opt/go/bin:$HOME/.local/opt/cmake-3.31.8-linux-aarch64/bin:$PATH"
+export LIBCLANG_PATH="$HOME/.local/opt/libclang/extracted/usr/lib/aarch64-linux-gnu"
+export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/aarch64-linux-gnu/15/include"
+```
+
+Adjust or drop those on a machine where the toolchain is installed normally.
 
 ### Do not "fix" the rquest dependency
 
