@@ -4,6 +4,8 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that co
 
 Written in Rust for a single-binary deployment with no runtime dependencies.
 
+Runs as one **HTTP daemon** (`axum` + `rmcp`'s Streamable HTTP transport) rather than a stdio subprocess per client — start it once, then point every MCP client (Claude Desktop, Cursor, a ZeroClaw agent, …) at the same `http://127.0.0.1:8210/mcp` URL. One process, one Garmin login, one moka cache and rate limiter shared by all of them.
+
 ---
 
 ## Why Rust?
@@ -28,72 +30,6 @@ On top of that, a **moka async cache** (60 s TTL) sits in front of every GET: ca
 ## Tool Coverage
 
 **77 tools** across 12 modules:
-
-```plantuml
-@startmindmap
-<style>
-mindmapDiagram {
-  node { FontSize 11; FontName "Segoe UI"; }
-  .health { BackgroundColor #a7f3d0; LineColor #065f46; FontColor #065f46; }
-  .activity { BackgroundColor #bfdbfe; LineColor #1e40af; FontColor #1e40af; }
-  .training { BackgroundColor #ddd6fe; LineColor #5b21b6; FontColor #5b21b6; }
-  .write { BackgroundColor #fed7aa; LineColor #92400e; FontColor #92400e; }
-  .device { BackgroundColor #e9d5ff; LineColor #6b21a8; FontColor #6b21a8; }
-  .research { BackgroundColor #fef9c3; LineColor #854d0e; FontColor #713f12; }
-  .neutral { BackgroundColor #f1f5f9; LineColor #64748b; FontColor #334155; }
-}
-</style>
-*[#1e3a5f] **Garmin MCP**\n**77 Tools**
-**[#1d4ed8] Activities (14) <<activity>>
-***_ by-date · fordate
-***_ recent · count · types
-***_ splits · typed-splits · summaries
-***_ weather · HR zones · exercise sets
-***_ gear · training effect
-**[#7c3aed] Training (3) <<training>>
-***_ training status
-***_ weekly progress
-***_ race predictions
-**[#7c3aed] Workouts (5) <<training>>
-***_ list · get · scheduled
-***_ delete · schedule
-**[#854d0e] Research (4) <<research>>
-***_ daily stats range (20 metrics)
-***_ sleep range (16 metrics)
-***_ HRV range (9 metrics)
-***_ weekly summary (mean/std/min/max)
-left side
-**[#065f46] Health & Wellness (21) <<health>>
-***_ stats · steps · floors
-***_ sleep · heart rate · RHR
-***_ stress · body battery & events
-***_ HRV · SpO₂ · respiration
-***_ training readiness · fitness age
-***_ endurance · hill · lactate
-***_ hydration · weigh-ins · blood pressure
-**[#92400e] Write / Data (3) <<write>>
-***_ log hydration
-***_ record blood pressure
-***_ body composition
-**[#6b21a8] Devices (6) <<device>>
-***_ list · last used · primary
-***_ settings · solar · alarms
-**[#475569] User Profile (4) <<neutral>>
-***_ profile · settings
-***_ full name · unit system
-**[#475569] Gear (3) <<neutral>>
-***_ list · add · remove
-**[#475569] Challenges (8) <<neutral>>
-***_ badges earned / available
-***_ badge challenges · ad-hoc
-***_ virtual · goals · PRs
-**[#475569] Nutrition (3) <<neutral>>
-***_ food log · settings · custom foods
-**[#475569] Women's Health (3) <<neutral>>
-***_ menstrual day · calendar
-***_ pregnancy summary
-@endmindmap
-```
 
 | Module | Tools | Highlights |
 |--------|------:|---|
@@ -206,7 +142,70 @@ cargo install --path .
 
 ---
 
+## Running
+
+The binary always serves MCP over **Streamable HTTP** — there is no stdio mode. It authenticates once at startup, then listens on `127.0.0.1:$GARMIN_MCP_HTTP_PORT` (default `8210`) at `/mcp`.
+
+```bash
+# With credential files (recommended)
+GARMIN_EMAIL_FILE=~/.garmin_email GARMIN_PASSWORD_FILE=~/.garmin_password \
+  ./target/release/garmin-mcp
+# Authenticated. Serving MCP over HTTP on http://127.0.0.1:8210/mcp
+
+# Or with a .env file in the working directory (local dev — see Quick-start below)
+./target/release/garmin-mcp
+
+# Custom port
+GARMIN_MCP_HTTP_PORT=9000 ./target/release/garmin-mcp
+```
+
+Because it's one long-lived process, run it as a background service rather than launching it per-client. On macOS, a `launchd` agent works well:
+
+```xml
+<!-- ~/Library/LaunchAgents/com.garmin.mcp.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.garmin.mcp</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>GARMIN_EMAIL_FILE</key><string>/Users/you/.garmin_email</string>
+        <key>GARMIN_PASSWORD_FILE</key><string>/Users/you/.garmin_password</string>
+        <key>GARMIN_SESSION_FILE</key><string>/Users/you/.garmin_mcp/.garmin_session.json</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array><string>/Users/you/.cargo/bin/garmin-mcp</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardErrorPath</key><string>/Users/you/.garmin_mcp/logs/daemon.stderr.log</string>
+    <key>StandardOutPath</key><string>/Users/you/.garmin_mcp/logs/daemon.stdout.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.garmin.mcp.plist
+# after editing: launchctl unload then launchctl load again to pick up changes
+```
+
+On Linux, the equivalent is a `systemd --user` unit with `Environment=` (or `EnvironmentFile=`) lines and `WantedBy=default.target`.
+
+### MCP Inspector
+
+```bash
+GARMIN_EMAIL_FILE=~/.garmin_email GARMIN_PASSWORD_FILE=~/.garmin_password \
+  ./target/release/garmin-mcp &
+npx @modelcontextprotocol/inspector
+# In the Inspector UI: Transport = "Streamable HTTP", URL = http://127.0.0.1:8210/mcp
+```
+
+---
+
 ## Configuration
+
+Every client below just needs the daemon's URL — start `garmin-mcp` once (see **Running** above), then point each client at `http://127.0.0.1:8210/mcp`.
 
 ### Claude Desktop
 
@@ -216,33 +215,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 {
   "mcpServers": {
     "garmin": {
-      "command": "/path/to/garmin-mcp",
-      "env": {
-        "GARMIN_EMAIL": "you@example.com",
-        "GARMIN_PASSWORD": "your_password"
-      }
-    }
-  }
-}
-```
-
-Or use credential files (recommended — keeps secrets out of the config file):
-
-```bash
-echo "you@example.com" > ~/.garmin_email
-echo "your_password"   > ~/.garmin_password
-chmod 600 ~/.garmin_email ~/.garmin_password
-```
-
-```json
-{
-  "mcpServers": {
-    "garmin": {
-      "command": "/path/to/garmin-mcp",
-      "env": {
-        "GARMIN_EMAIL_FILE": "/Users/you/.garmin_email",
-        "GARMIN_PASSWORD_FILE": "/Users/you/.garmin_password"
-      }
+      "url": "http://127.0.0.1:8210/mcp"
     }
   }
 }
@@ -250,25 +223,57 @@ chmod 600 ~/.garmin_email ~/.garmin_password
 
 ### Cursor / other MCP clients
 
-Same JSON structure; consult your client's MCP server configuration docs for the config file location.
+Same `"url"`-based shape; consult your client's docs for its remote/HTTP MCP server config, and for the config file location.
+
+### ZeroClaw
+
+[ZeroClaw](https://github.com/zeroclaw) agents are configured via a per-instance `config.toml`. Point the `[[mcp.servers]]` block at the daemon's URL, then bundle it and grant it to an agent:
+
+```toml
+[[mcp.servers]]
+name = "garmin"
+transport = "http"
+url = "http://127.0.0.1:8210/mcp"
+tool_timeout_secs = 60
+
+[mcp_bundles.garmin]
+servers = ["garmin"]
+
+[agents.default]
+mcp_bundles = ["garmin"]              # append to whatever bundles the agent already has
+```
+
+No credentials belong in `config.toml` at all — the daemon holds its own Garmin session, authenticated once from the `GARMIN_EMAIL_FILE` / `GARMIN_PASSWORD_FILE` in its launchd/systemd unit (see **Running**). This also means every ZeroClaw instance (and Claude Desktop, and anything else) that points at the same URL shares one Garmin login instead of each doing its own.
+
+The 70 read-only `get_*` tools are safe to auto-approve in the instance's risk profile (write tools — `add_hydration_data`, `set_blood_pressure`, `add_body_composition`, `schedule_workout`, `delete_scheduled_workout`, gear add/remove — are worth leaving on manual approval):
+
+```toml
+[risk_profiles.default]
+auto_approve = [
+    # ...existing entries...
+    "garmin__get_stats", "garmin__get_sleep_summary", "garmin__get_hrv_data",
+    "garmin__get_daily_stats_range", "garmin__get_sleep_range", "garmin__get_hrv_range",
+    # ...remaining garmin__get_* tools
+]
+```
+
+Example: a ZeroClaw health agent using the Garmin MCP tools to analyze several days of activity, stress, and Body Battery data over Discord:
+
+![ZeroClaw health agent reading Garmin data](screenshots/zeroclaw-health-agent-example.png)
 
 ### Display name override
 
-Some health tools (stats, sleep, heart rate, RHR) require your Garmin display name. The server auto-detects it at startup, but you can override it explicitly:
+Some health tools (stats, sleep, heart rate, RHR) require your Garmin display name. The server auto-detects it at startup, but you can override it explicitly in the daemon's own environment (not the client config):
 
-```json
-"env": {
-  "GARMIN_EMAIL": "...",
-  "GARMIN_PASSWORD": "...",
-  "GARMIN_DISPLAY_NAME": "your_garmin_handle"
-}
+```
+GARMIN_DISPLAY_NAME=your_garmin_handle
 ```
 
 ---
 
 ## Quick-start: `.env` file
 
-For local development and smoke-testing, create a `.env` file in the project root (already in `.gitignore`):
+For local development and smoke-testing, create a `.env` file in the project root (already in `.gitignore`, and `chmod 600` it — it holds a plaintext password):
 
 ```
 GARMIN_EMAIL=you@example.com
@@ -277,7 +282,7 @@ GARMIN_PASSWORD=your_password
 # GARMIN_DISPLAY_NAME=your_handle
 ```
 
-The binary loads `.env` at startup via `dotenvy`. Existing process environment variables always win, so `GARMIN_EMAIL=x cargo run` still overrides the file.
+The binary loads `.env` from its **working directory** at startup via `dotenvy` — so `cd` into the project before running it this way. Existing process environment variables always win, so `GARMIN_EMAIL=x cargo run` still overrides the file. For anything long-running, prefer the credential-file + launchd/systemd setup in **Running** — a background service's working directory isn't guaranteed to be the repo, so `.env` won't reliably reach it.
 
 ---
 
@@ -289,6 +294,7 @@ The binary loads `.env` at startup via `dotenvy`. Existing process environment v
 | `GARMIN_EMAIL_FILE` | ✅ (or direct) | Path to file containing email |
 | `GARMIN_PASSWORD` | ✅ (or `_FILE`) | Garmin Connect password |
 | `GARMIN_PASSWORD_FILE` | ✅ (or direct) | Path to file containing password |
+| `GARMIN_MCP_HTTP_PORT` | optional | Port the HTTP MCP server listens on (default `8210`) |
 | `GARMIN_DISPLAY_NAME` | optional | Override auto-detected display name |
 | `GARMIN_SERVICE_TICKET` | optional | Pre-obtained SSO service ticket — exchanged directly for a DI session, skipping the login page |
 | `GARMIN_MFA_CODE` | optional | MFA code, for accounts with MFA enabled |
@@ -296,31 +302,6 @@ The binary loads `.env` at startup via `dotenvy`. Existing process environment v
 | `GARMIN_SESSION_FILE` | optional | Override the cached-session path (default: `.di_session.json` in the working directory) |
 
 Any of these set to an **empty** string counts as unset — the server falls through to the `_FILE` variant or the interactive prompt, as if the variable were absent.
-
----
-
-## Running
-
-```bash
-# With .env file in project root (recommended for local dev)
-echo "GARMIN_EMAIL=you@example.com" >> .env
-echo "GARMIN_PASSWORD=secret"       >> .env
-./target/release/garmin-mcp
-
-# Inline env vars (override .env)
-GARMIN_EMAIL=you@example.com GARMIN_PASSWORD=secret ./target/release/garmin-mcp
-
-# With credential files (recommended for production)
-GARMIN_EMAIL_FILE=~/.garmin_email GARMIN_PASSWORD_FILE=~/.garmin_password \
-  ./target/release/garmin-mcp
-```
-
-### MCP Inspector
-
-```bash
-GARMIN_EMAIL=... GARMIN_PASSWORD=... \
-  npx @modelcontextprotocol/inspector ./target/release/garmin-mcp
-```
 
 ---
 
@@ -414,7 +395,7 @@ bad credentials or a Garmin API change.
 
 ```
 src/
-├── main.rs          — thin binary entrypoint: load .env, authenticate, stdio transport
+├── main.rs          — thin binary entrypoint: load .env, authenticate, serve MCP over HTTP (axum + StreamableHttpService, GARMIN_MCP_HTTP_PORT)
 ├── lib.rs           — library root (pub mod auth/client/di_auth/tools), used by main.rs and tests/
 ├── auth.rs          — server wiring: builds the shared client, authenticates, resolves display name
 ├── di_auth.rs       — DI OAuth2: SSO + MFA login, service-ticket exchange, token refresh, session cache
@@ -438,7 +419,42 @@ src/
 
 ### GET pipeline (`client.rs`)
 
-<div style="font-family:'Segoe UI',system-ui,sans-serif;max-width:860px;margin:1.5rem auto;background:#f0f7f0;border-radius:12px;padding:24px 20px;border:1px solid #b8d4b8;box-shadow:0 3px 12px rgba(0,50,0,.1)"><h4 style="text-align:center;margin:0 0 16px;font-size:15px;color:#1a3c1a;font-weight:700">🦀 Garmin MCP Rust · GET Request Pipeline</h4><div style="background:#6d28d9;border-radius:8px;padding:12px 16px;color:#fff"><div style="font-weight:600;font-size:11px;letter-spacing:.5px;text-transform:uppercase;opacity:.75;margin-bottom:7px">🔧 Tool Layer · 77 tools</div><div style="display:grid;grid-template-columns:2fr 2fr 2fr 1fr;gap:6px"><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:7px;font-size:10px;text-align:center">GET tools<small style="display:block;opacity:.75;margin-top:2px">health · activity · training</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:7px;font-size:10px;text-align:center">Write tools<small style="display:block;opacity:.75;margin-top:2px">POST · PUT · DELETE</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:7px;font-size:10px;text-align:center">#[tool_router]<small style="display:block;opacity:.75;margin-top:2px">GarminMcpServer</small></div><div style="background:rgba(255,255,255,.2);border-radius:5px;padding:7px;font-size:10px;text-align:center;border:1px solid rgba(255,255,255,.35)">Arc&lt;GarminApiClient&gt;</div></div></div><div style="text-align:center;color:#9ca3af;font-size:20px;line-height:1.8">↓</div><div style="background:#1d4ed8;border-radius:8px;padding:12px 16px;color:#fff"><div style="font-weight:600;font-size:11px;letter-spacing:.5px;text-transform:uppercase;opacity:.75;margin-bottom:7px">📋 ClinicalExport Output Layer</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px"><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:7px 5px;font-size:10px;text-align:center">FlatSummary<small style="display:block;opacity:.75;margin-top:2px">stats · sleep<br>HR · stress · resp</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:7px 5px;font-size:10px;text-align:center">HrvPayload<small style="display:block;opacity:.75;margin-top:2px">summary +<br>5-min readings</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:7px 5px;font-size:10px;text-align:center">TimeseriesArray<small style="display:block;opacity:.75;margin-top:2px">[[ts,v], …]<br>body battery</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:7px 5px;font-size:10px;text-align:center">EventTable<small style="display:block;opacity:.75;margin-top:2px">BP · weigh-ins<br>date-range</small></div><div style="background:rgba(255,255,255,.2);border-radius:5px;padding:7px 5px;font-size:10px;text-align:center;border:1px dashed rgba(255,255,255,.5)"><b>JSON</b> · CSV<small style="display:block;opacity:.8;margin-top:2px">EDF: trait slot<br>reserved</small></div></div></div><div style="text-align:center;color:#9ca3af;font-size:20px;line-height:1.8">↓ <small style="font-size:11px;color:#6b7280">GET path only · writes skip cache ↗</small></div><div style="background:#166534;border-radius:8px;padding:12px 16px;color:#fff"><div style="font-weight:600;font-size:11px;letter-spacing:.5px;text-transform:uppercase;opacity:.75;margin-bottom:7px">🗃️ moka Async Cache</div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:8px;font-size:10px"><b>TTL Cache</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">60s TTL · 1 000 entries<br>Key: endpoint?k=v sorted<br>Value: Arc&lt;Value&gt;</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:8px;font-size:10px"><b>Singleflight</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">try_get_with built-in<br>Concurrent callers share<br>one in-flight fetch</small></div><div style="background:rgba(255,255,255,.25);border-radius:5px;padding:8px;font-size:10px;border:1px solid rgba(255,255,255,.3)"><b>Cache Hit ✅</b><small style="display:block;margin-top:3px;opacity:.9;line-height:1.6">Returns Arc&lt;Value&gt;<br>Skips rate-limiter<br>Zero network I/O</small></div></div></div><div style="text-align:center;color:#9ca3af;font-size:20px;line-height:1.8">↓ <small style="font-size:11px;color:#6b7280">cache miss</small></div><div style="background:#b45309;border-radius:8px;padding:12px 16px;color:#fff"><div style="font-weight:600;font-size:11px;letter-spacing:.5px;text-transform:uppercase;opacity:.75;margin-bottom:7px">⏱️ governor Rate Limiter</div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:8px;font-size:10px"><b>60 req/min</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">Token bucket algorithm<br>Configurable constant</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:8px;font-size:10px"><b>Shared Budget</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">GET + POST/PUT/DELETE<br>one limiter for all<br>until_ready().await</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:8px;font-size:10px"><b>Lockout Guard</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">Prevents Garmin<br>per-session rate-limit<br>abuse and bans</small></div></div></div><div style="text-align:center;color:#9ca3af;font-size:20px;line-height:1.8">↓</div><div style="background:#991b1b;border-radius:8px;padding:12px 16px;color:#fff"><div style="font-weight:600;font-size:11px;letter-spacing:.5px;text-transform:uppercase;opacity:.75;margin-bottom:7px">🔒 Rust Sync Layer · No Serialization</div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:8px;font-size:10px"><b>Arc&lt;RwLock&lt;DiSession&gt;&gt;</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">DI OAuth2 bearer token<br>Read-shared by every request<br>Never held across refresh I/O</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:8px;font-size:10px"><b>Refresh Mutex + Backoff</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">One refresher at a time<br>~24 h access · ~30 d refresh<br>Failures back off 30 s → 15 min</small></div><div style="background:rgba(255,255,255,.15);border-radius:5px;padding:8px;font-size:10px"><b>rquest::Client</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">Chrome 131 / Android TLS<br>One client: GET + writes<br>Reuses TLS + TCP + cookies</small></div></div></div><div style="text-align:center;color:#9ca3af;font-size:20px;line-height:1.8">↓</div><div style="background:#1e293b;border-radius:8px;padding:12px 16px;color:#fff"><div style="font-weight:600;font-size:11px;letter-spacing:.5px;text-transform:uppercase;opacity:.75;margin-bottom:7px">🌐 Garmin Connect API</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div style="background:rgba(255,255,255,.1);border-radius:5px;padding:8px;font-size:10px"><b>GET via rquest</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">connectapi.garmin.com<br>Fully concurrent · no Mutex<br>Duplicates coalesced by moka</small></div><div style="background:rgba(255,255,255,.1);border-radius:5px;padding:8px;font-size:10px"><b>POST/PUT/DELETE via rquest</b><small style="display:block;margin-top:3px;opacity:.85;line-height:1.6">Same client · same token<br>Bearer + NK: NT + X-app-ver<br>On success: cache.invalidate_all()</small></div></div></div></div>
+```mermaid
+flowchart TD
+    A["🔧 Tool Layer — 77 tools<br/>GET tools · Write tools<br/>#91;tool_router#93; → Arc&lt;GarminApiClient&gt;"]
+    B["📋 ClinicalExport Output Layer<br/>FlatSummary · HrvPayload · TimeseriesArray · EventTable<br/>JSON · CSV #40;EDF: reserved#41;"]
+    C["🗃️ moka Async Cache — 60s TTL, 1000 entries<br/>key: endpoint?k=v sorted · value: Arc&lt;Value&gt;<br/>singleflight coalesces concurrent callers"]
+    D["⏱️ governor Rate Limiter — 60 req/min<br/>token bucket · shared GET+write budget"]
+    E["🔒 Rust Sync Layer<br/>Arc&lt;RwLock&lt;DiSession&gt;&gt; — never held across refresh I/O<br/>refresh Mutex + backoff · rquest::Client #40;Chrome 131 / Android TLS#41;"]
+    F["🌐 Garmin Connect API<br/>connectapi.garmin.com"]
+    Z["✅ cache hit<br/>returns Arc&lt;Value&gt; — no network, no rate limiter"]
+    G["cache.invalidate_all#40;#41;<br/>on successful write"]
+
+    A --> B
+    B -->|GET path| C
+    B -.->|writes skip cache| D
+    C -->|hit| Z
+    C -->|miss| D
+    D --> E
+    E --> F
+    F -->|successful write| G
+
+    classDef tools fill:#6d28d9,color:#fff,stroke:#4c1d95
+    classDef out fill:#1d4ed8,color:#fff,stroke:#1e3a8a
+    classDef cache fill:#166534,color:#fff,stroke:#14532d
+    classDef rate fill:#b45309,color:#fff,stroke:#78350f
+    classDef sync fill:#991b1b,color:#fff,stroke:#7f1d1d
+    classDef api fill:#1e293b,color:#fff,stroke:#0f172a
+    classDef hit fill:#22c55e,color:#052e13,stroke:#166534
+
+    class A tools
+    class B out
+    class C cache
+    class D rate
+    class E sync
+    class F,G api
+    class Z hit
+```
 
 Write path (POST / PUT / DELETE) skips the cache, goes through the same rate limiter, then rquest with the bearer token read out of `Arc<RwLock<DiSession>>`. Successful writes call `cache.invalidate_all()` so the next GET sees fresh data.
 

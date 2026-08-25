@@ -4,7 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Model Context Protocol server (`garmin-mcp` binary) exposing 77 Garmin Connect tools over stdio.
+A Model Context Protocol server (`garmin-mcp` binary) exposing 77 Garmin Connect tools over
+**Streamable HTTP** (`axum` + `rmcp`'s `StreamableHttpService`, not stdio) — one long-lived
+daemon, authenticated once, that every MCP client points at via URL. Listens on
+`127.0.0.1:$GARMIN_MCP_HTTP_PORT` (default `8210`) at `/mcp`.
 `src/lib.rs` is the library crate; `src/main.rs` is a thin binary; `tests/` consumes the library.
 
 ## Commands
@@ -55,6 +58,10 @@ main.rs → auth::create_garmin_server()
             ├─ resolve_display_name(&http)  → probes 3 userprofile endpoints
             └─ GarminApiClient::new(http, session, display_name)
                  └─ GarminMcpServer (tools/mod.rs, #[tool_router])
+       → axum::serve — StreamableHttpService wrapping the server at /mcp,
+         GARMIN_MCP_HTTP_PORT (default 8210). GarminMcpServer is Clone (cheap:
+         shares the Arc<RwLock<DiSession>> + http client), so every HTTP
+         session from every connected MCP client reuses this one login.
 ```
 
 ### Auth (`src/di_auth.rs`)
