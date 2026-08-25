@@ -15,10 +15,7 @@ pub async fn earned_badges(api: &GarminApiClient) -> String {
 }
 
 pub async fn available_badge_challenges(api: &GarminApiClient) -> String {
-    match api
-        .api_json("/badge-service/badge/available", None)
-        .await
-    {
+    match api.api_json("/badge-service/badge/available", None).await {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
         Err(e) => format!("Error retrieving available badge challenges: {e}"),
     }
@@ -64,7 +61,10 @@ pub async fn adhoc_challenges(api: &GarminApiClient, start: u32, limit: u32) -> 
 
 pub async fn inprogress_virtual_challenges(api: &GarminApiClient) -> String {
     match api
-        .api_json("/fitnesschallenge-service/challenge/virtual/in-progress", None)
+        .api_json(
+            "/fitnesschallenge-service/challenge/virtual/in-progress",
+            None,
+        )
         .await
     {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
@@ -84,14 +84,8 @@ pub async fn goals(api: &GarminApiClient, goal_type: Option<&str>) -> String {
             params.insert("goalType".to_string(), gt.to_string());
         }
     }
-    match api
-        .api_json("/goal-service/goal/list", Some(params))
-        .await
-    {
-        Ok(data) => crate::client::render_or_friendly(
-            &data,
-            "No active goals.",
-        ),
+    match api.api_json("/goal-service/goal/list", Some(params)).await {
+        Ok(data) => crate::client::render_or_friendly(&data, "No active goals."),
         Err(e) => format!("Error retrieving goals: {e}"),
     }
 }

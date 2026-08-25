@@ -1,53 +1,41 @@
-use anyhow::{bail, Result};
-use garmin_client::GarminClient;
+use anyhow::Result;
 
-use crate::client::{read_session_file, GarminApiClient};
+use crate::client::{self, GarminApiClient};
+use crate::di_auth;
 use crate::tools::GarminMcpServer;
 
-pub async fn create_garmin_server() -> Result<GarminMcpServer> {
-    let email = read_secret("GARMIN_EMAIL", "GARMIN_EMAIL_FILE")?;
-    let password = read_secret("GARMIN_PASSWORD", "GARMIN_PASSWORD_FILE")?;
+pub async fn create_garmin_client() -> Result<GarminApiClient> {
+    let _ = dotenvy::dotenv();
 
-    // Workaround for garmin_client 0.2.1 bug (lib.rs:534):
-    //   retrieve_json_session() calls Value::to_string() on the cached token,
-    //   re-quoting the JWT so every request sends `Authorization: Bearer "eyJ..."`.
-    //   Force a fresh OAuth handshake each launch until fixed upstream.
-    let _ = std::fs::remove_file(".garmin_session.json");
+    // One impersonated client for the whole process. The SSO login, the
+    // display-name probe and every API call then share its cookie jar — the
+    // Cloudflare `__cflb` cookie earned during login has to reach connectapi —
+    // and its connection pool.
+    let http = di_auth::build_impersonated_client()?;
 
-    eprintln!("Authenticating with Garmin Connect...");
-    let mut client = GarminClient::new();
-    if !client.login(&email, &password).await {
-        bail!("Garmin authentication failed. Check GARMIN_EMAIL and GARMIN_PASSWORD.");
-    }
+    let session = di_auth::authenticate(&http).await?;
 
-    // After login(), garmin_client writes .garmin_session.json with the raw
-    // token.  read_session_file() uses .as_str() (not .to_string()) so the
-    // JWT is never re-quoted.
-    let (bearer_token, token_expires_at) = read_session_file().unwrap_or_else(|e| {
-        eprintln!("Warning: could not read session file ({e}); write operations may fail after ~1 h.");
-        (String::new(), 0)
-    });
-
-    let display_name = resolve_display_name(&mut client).await;
+    let display_name = resolve_display_name(&http, &session.access_token).await;
     if display_name.is_empty() {
         eprintln!("Warning: display name is empty.");
-        eprintln!("  Tools requiring display name (get_stats, get_sleep_summary, …)");
-        eprintln!("  will fail. Fix: set GARMIN_DISPLAY_NAME=<your Garmin handle> in env.");
+        eprintln!("  Set GARMIN_DISPLAY_NAME=<handle> in .env to override.");
     } else {
         eprintln!("Logged in as: {display_name}");
     }
 
-    let api = GarminApiClient::new(client, display_name, bearer_token, token_expires_at);
+    Ok(GarminApiClient::new(http, session, display_name))
+}
+
+pub async fn create_garmin_server() -> Result<GarminMcpServer> {
+    let api = create_garmin_client().await?;
     Ok(GarminMcpServer::new(api))
 }
 
-/// Try env var override first, then probe multiple Garmin API endpoints.
-async fn resolve_display_name(client: &mut GarminClient) -> String {
-    if let Ok(name) = std::env::var("GARMIN_DISPLAY_NAME") {
-        let name = name.trim().to_string();
-        if !name.is_empty() {
-            return name;
-        }
+/// Try env var override first, then probe multiple Garmin API endpoints with
+/// the DI access token as a Bearer credential.
+async fn resolve_display_name(client: &rquest::Client, access_token: &str) -> String {
+    if let Some(name) = di_auth::non_empty_env("GARMIN_DISPLAY_NAME") {
+        return name;
     }
 
     let endpoints = [
@@ -57,7 +45,7 @@ async fn resolve_display_name(client: &mut GarminClient) -> String {
     ];
 
     for endpoint in &endpoints {
-        if let Some(name) = try_display_name(client, endpoint).await {
+        if let Some(name) = try_display_name(client, endpoint, access_token).await {
             return name;
         }
     }
@@ -65,13 +53,25 @@ async fn resolve_display_name(client: &mut GarminClient) -> String {
     String::new()
 }
 
-async fn try_display_name(client: &mut GarminClient, endpoint: &str) -> Option<String> {
-    // garmin_client's url_builder prepends "/", so a leading slash produces "//path" → 404/error.
-    let endpoint = endpoint.trim_start_matches('/');
-    let ok = client.api_request(endpoint, None, true, None).await;
-    let text = client.get_last_resp_text().to_string();
+async fn try_display_name(
+    client: &rquest::Client,
+    endpoint: &str,
+    access_token: &str,
+) -> Option<String> {
+    let url = client::api_url(endpoint);
 
-    eprintln!("[auth] {endpoint} → ok={ok}, body_len={}", text.len());
+    let resp = client::garmin_headers(client.get(&url), access_token)
+        .send()
+        .await
+        .ok()?;
+
+    let status = resp.status();
+    let text = resp.text().await.ok()?;
+
+    eprintln!(
+        "[auth] {endpoint} -> status={status}, body_len={}",
+        text.len()
+    );
 
     if text.is_empty() {
         return None;
@@ -85,16 +85,4 @@ async fn try_display_name(client: &mut GarminClient, endpoint: &str) -> Option<S
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-}
-
-fn read_secret(env_key: &str, file_env_key: &str) -> Result<String> {
-    if let Ok(val) = std::env::var(env_key) {
-        return Ok(val.trim().to_string());
-    }
-    if let Ok(path) = std::env::var(file_env_key) {
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("Could not read {path}: {e}"))?;
-        return Ok(content.trim().to_string());
-    }
-    bail!("{env_key} or {file_env_key} environment variable is required")
 }

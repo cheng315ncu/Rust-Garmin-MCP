@@ -17,12 +17,19 @@
 .garmin_password.*
 .garmin_session.json
 .garmin_session*.json
+.di_session.json
+.di_session*.json
+.mfa_code.txt
 
 # Local assistant / editor state
 .claude/
 .cursor/
 .vscode/
 .idea/
+.codegraph/
+# Auto-maintained agent memory: host-specific paths and personal working
+# preferences, not project documentation. Shared guidance goes in CLAUDE.md.
+AGENTS.md
 
 # OS / local temp files
 .DS_Store

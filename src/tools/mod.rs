@@ -1,24 +1,24 @@
-mod activities;
-mod challenges;
-mod data_management;
-mod devices;
-mod gear;
-mod health_wellness;
-mod nutrition;
-mod output;
-mod research;
-mod training;
-mod user_profile;
-mod womens_health;
-mod workouts;
+pub mod activities;
+pub mod challenges;
+pub mod data_management;
+pub mod devices;
+pub mod gear;
+pub mod health_wellness;
+pub mod nutrition;
+pub mod output;
+pub mod research;
+pub mod training;
+pub mod user_profile;
+pub mod womens_health;
+pub mod workouts;
 
 use std::sync::Arc;
 
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use serde::Deserialize;
 
-use crate::client::GarminApiClient;
 use self::output::OutputFormat;
+use crate::client::GarminApiClient;
 
 #[derive(Clone)]
 pub struct GarminMcpServer {
@@ -208,7 +208,9 @@ struct AddBodyCompositionParams {
 impl GarminMcpServer {
     // ---- Activities ----
 
-    #[tool(description = "Get a list of activities between two dates, optionally filtered by activity type (running, cycling, swimming, hiking, walking, other)")]
+    #[tool(
+        description = "Get a list of activities between two dates, optionally filtered by activity type (running, cycling, swimming, hiking, walking, other)"
+    )]
     async fn get_activities_by_date(
         &self,
         Parameters(p): Parameters<GetActivitiesByDateParams>,
@@ -227,7 +229,9 @@ impl GarminMcpServer {
         activities::activity(&self.api, &p.activity_id).await
     }
 
-    #[tool(description = "Get the N most recent activities (curated fields: id, name, type, start_time, distance, duration, calories, avg/max HR, steps)")]
+    #[tool(
+        description = "Get the N most recent activities (curated fields: id, name, type, start_time, distance, duration, calories, avg/max HR, steps)"
+    )]
     async fn get_recent_activities(
         &self,
         Parameters(p): Parameters<GetRecentActivitiesParams>,
@@ -235,7 +239,9 @@ impl GarminMcpServer {
         activities::recent_activities(&self.api, p.limit.unwrap_or(10)).await
     }
 
-    #[tool(description = "Get activities that occurred on a specific date (uses Garmin's by-date endpoint)")]
+    #[tool(
+        description = "Get activities that occurred on a specific date (uses Garmin's by-date endpoint)"
+    )]
     async fn get_activities_fordate(&self, Parameters(p): Parameters<DateParam>) -> String {
         activities::activities_fordate(&self.api, &p.date).await
     }
@@ -307,29 +313,40 @@ impl GarminMcpServer {
 
     // ---- Health & Wellness ----
 
-    #[tool(description = "Get daily health stats for a date: steps, calories, heart rate, stress levels, body battery, SpO2, and intensity minutes. Set format='csv' for a single-row CSV.")]
+    #[tool(
+        description = "Get daily health stats for a date: steps, calories, heart rate, stress levels, body battery, SpO2, and intensity minutes. Set format='csv' for a single-row CSV."
+    )]
     async fn get_stats(&self, Parameters(p): Parameters<DateFormatParam>) -> String {
         health_wellness::stats(&self.api, &p.date, p.format.unwrap_or_default()).await
     }
 
-    #[tool(description = "Get curated sleep summary for a date: total duration, sleep stages (deep/light/REM/awake), respiration, SpO2, and sleep scores. Set format='csv' for a single-row CSV (researchers can concatenate across days).")]
+    #[tool(
+        description = "Get curated sleep summary for a date: total duration, sleep stages (deep/light/REM/awake), respiration, SpO2, and sleep scores. Set format='csv' for a single-row CSV (researchers can concatenate across days)."
+    )]
     async fn get_sleep_summary(&self, Parameters(p): Parameters<DateFormatParam>) -> String {
         health_wellness::sleep_summary(&self.api, &p.date, p.format.unwrap_or_default()).await
     }
 
-    #[tool(description = "Get daily heart rate summary for a date: resting/min/max HR and sample count. Set format='csv' for a single-row CSV.")]
+    #[tool(
+        description = "Get daily heart rate summary for a date: resting/min/max HR and sample count. Set format='csv' for a single-row CSV."
+    )]
     async fn get_daily_heart_rate(&self, Parameters(p): Parameters<DateFormatParam>) -> String {
         health_wellness::daily_heart_rate(&self.api, &p.date, p.format.unwrap_or_default()).await
     }
 
-    #[tool(description = "Get daily stress summary for a date: average and max stress levels, with sample counts. Set format='csv' for a single-row CSV.")]
+    #[tool(
+        description = "Get daily stress summary for a date: average and max stress levels, with sample counts. Set format='csv' for a single-row CSV."
+    )]
     async fn get_stress_summary(&self, Parameters(p): Parameters<DateFormatParam>) -> String {
         health_wellness::stress_summary(&self.api, &p.date, p.format.unwrap_or_default()).await
     }
 
-    #[tool(description = "Get body battery summary for a date: charged, drained, starting/ending values, sample count. Set format='csv' for raw timeseries (timestamp_ms,body_battery).")]
+    #[tool(
+        description = "Get body battery summary for a date: charged, drained, starting/ending values, sample count. Set format='csv' for raw timeseries (timestamp_ms,body_battery)."
+    )]
     async fn get_body_battery_summary(&self, Parameters(p): Parameters<DateFormatParam>) -> String {
-        health_wellness::body_battery_summary(&self.api, &p.date, p.format.unwrap_or_default()).await
+        health_wellness::body_battery_summary(&self.api, &p.date, p.format.unwrap_or_default())
+            .await
     }
 
     #[tool(description = "Get daily step counts for each day in a date range")]
@@ -342,12 +359,16 @@ impl GarminMcpServer {
         health_wellness::training_readiness(&self.api, &p.date).await
     }
 
-    #[tool(description = "Get body battery charge/drain events for a date (meals, sleep, activity, stress)")]
+    #[tool(
+        description = "Get body battery charge/drain events for a date (meals, sleep, activity, stress)"
+    )]
     async fn get_body_battery_events(&self, Parameters(p): Parameters<DateParam>) -> String {
         health_wellness::body_battery_events(&self.api, &p.date).await
     }
 
-    #[tool(description = "Get blood pressure readings within a date range. Set format='csv' for header + one row per measurement (timestamp_local,timestamp_gmt,systolic,diastolic,pulse,notes).")]
+    #[tool(
+        description = "Get blood pressure readings within a date range. Set format='csv' for header + one row per measurement (timestamp_local,timestamp_gmt,systolic,diastolic,pulse,notes)."
+    )]
     async fn get_blood_pressure(&self, Parameters(p): Parameters<DateRangeFormatParam>) -> String {
         health_wellness::blood_pressure(
             &self.api,
@@ -373,22 +394,30 @@ impl GarminMcpServer {
         health_wellness::hydration_data(&self.api, &p.date).await
     }
 
-    #[tool(description = "Get respiration (breathing rate) summary for a date: lowest/highest/avg waking/avg sleep BPM. Set format='csv' for a single-row CSV.")]
+    #[tool(
+        description = "Get respiration (breathing rate) summary for a date: lowest/highest/avg waking/avg sleep BPM. Set format='csv' for a single-row CSV."
+    )]
     async fn get_respiration_data(&self, Parameters(p): Parameters<DateFormatParam>) -> String {
         health_wellness::respiration_data(&self.api, &p.date, p.format.unwrap_or_default()).await
     }
 
-    #[tool(description = "Get SpO2 (blood oxygen saturation) summary for a date: avg/lowest/latest SpO2, 7-day avg, sleep SpO2. Set format='csv' for a single-row CSV.")]
+    #[tool(
+        description = "Get SpO2 (blood oxygen saturation) summary for a date: avg/lowest/latest SpO2, 7-day avg, sleep SpO2. Set format='csv' for a single-row CSV."
+    )]
     async fn get_spo2_data(&self, Parameters(p): Parameters<DateFormatParam>) -> String {
         health_wellness::spo2_data(&self.api, &p.date, p.format.unwrap_or_default()).await
     }
 
-    #[tool(description = "Get all-day wellness events (activity detections, move alerts, etc.) for a date")]
+    #[tool(
+        description = "Get all-day wellness events (activity detections, move alerts, etc.) for a date"
+    )]
     async fn get_all_day_events(&self, Parameters(p): Parameters<DateParam>) -> String {
         health_wellness::all_day_events(&self.api, &p.date).await
     }
 
-    #[tool(description = "Get HRV (Heart Rate Variability) summary and status for a date. Default JSON returns the summary + reading count; set format='csv' to receive raw 5-minute HRV readings (reading_time_gmt,hrv_value) for biosignal analysis.")]
+    #[tool(
+        description = "Get HRV (Heart Rate Variability) summary and status for a date. Default JSON returns the summary + reading count; set format='csv' to receive raw 5-minute HRV readings (reading_time_gmt,hrv_value) for biosignal analysis."
+    )]
     async fn get_hrv_data(&self, Parameters(p): Parameters<DateFormatParam>) -> String {
         health_wellness::hrv_data(&self.api, &p.date, p.format.unwrap_or_default()).await
     }
@@ -413,7 +442,9 @@ impl GarminMcpServer {
         health_wellness::lactate_threshold(&self.api, &p.date).await
     }
 
-    #[tool(description = "Get weigh-in records within a date range. Set format='csv' for header + one row per weigh-in (date,timestamp_gmt,weight,bmi,bodyFat,bodyWater,boneMass,muscleMass,…).")]
+    #[tool(
+        description = "Get weigh-in records within a date range. Set format='csv' for header + one row per weigh-in (date,timestamp_gmt,weight,bmi,bodyFat,bodyWater,boneMass,muscleMass,…)."
+    )]
     async fn get_daily_weigh_ins(&self, Parameters(p): Parameters<DateRangeFormatParam>) -> String {
         health_wellness::daily_weigh_ins(
             &self.api,
@@ -426,20 +457,32 @@ impl GarminMcpServer {
 
     // ---- Training ----
 
-    #[tool(description = "Get training status for a date: VO2 max, load focus, training status phrase, and acute/chronic load")]
+    #[tool(
+        description = "Get training status for a date: VO2 max, load focus, training status phrase, and acute/chronic load"
+    )]
     async fn get_training_status(&self, Parameters(p): Parameters<DateParam>) -> String {
         training::training_status(&self.api, &p.date).await
     }
 
-    #[tool(description = "Get weekly progress summary between two dates, optionally filtered by activity type")]
+    #[tool(
+        description = "Get weekly progress summary between two dates, optionally filtered by activity type"
+    )]
     async fn get_progress_summary_between_dates(
         &self,
         Parameters(p): Parameters<GetProgressSummaryParams>,
     ) -> String {
-        training::progress_summary(&self.api, &p.start_date, &p.end_date, p.activity_type.as_deref()).await
+        training::progress_summary(
+            &self.api,
+            &p.start_date,
+            &p.end_date,
+            p.activity_type.as_deref(),
+        )
+        .await
     }
 
-    #[tool(description = "Get race time predictions (5K, 10K, half-marathon, marathon) based on recent training")]
+    #[tool(
+        description = "Get race time predictions (5K, 10K, half-marathon, marathon) based on recent training"
+    )]
     async fn get_race_predictions(&self) -> String {
         training::race_predictions(&self.api).await
     }
@@ -585,7 +628,9 @@ impl GarminMcpServer {
         user_profile::get_full_name(&self.api).await
     }
 
-    #[tool(description = "Get the user's preferred measurement system (metric or statute/imperial)")]
+    #[tool(
+        description = "Get the user's preferred measurement system (metric or statute/imperial)"
+    )]
     async fn get_unit_system(&self) -> String {
         user_profile::get_unit_system(&self.api).await
     }
@@ -629,37 +674,67 @@ impl GarminMcpServer {
 
     // ---- Research / Longitudinal Analysis ----
 
-    #[tool(description = "Fetch daily health stats (steps, calories, HR, stress, body battery, SpO2, respiration — 20 metrics) for each day in a date range. Returns a JSON array or set format='csv' for a panel dataset suitable for pandas/R import. Max 366 days per call. Days without data appear as date-only rows.")]
-    async fn get_daily_stats_range(&self, Parameters(p): Parameters<DateRangeFormatParam>) -> String {
-        research::daily_stats_range(&self.api, &p.start_date, &p.end_date, p.format.unwrap_or_default()).await
+    #[tool(
+        description = "Fetch daily health stats (steps, calories, HR, stress, body battery, SpO2, respiration — 20 metrics) for each day in a date range. Returns a JSON array or set format='csv' for a panel dataset suitable for pandas/R import. Max 366 days per call. Days without data appear as date-only rows."
+    )]
+    async fn get_daily_stats_range(
+        &self,
+        Parameters(p): Parameters<DateRangeFormatParam>,
+    ) -> String {
+        research::daily_stats_range(
+            &self.api,
+            &p.start_date,
+            &p.end_date,
+            p.format.unwrap_or_default(),
+        )
+        .await
     }
 
-    #[tool(description = "Fetch sleep summary (total/deep/light/REM/awake seconds, SpO2, respiration, stress, awake count — 16 metrics) for each day in a date range. Returns a JSON array or set format='csv' for longitudinal sleep analysis. Max 366 days per call.")]
+    #[tool(
+        description = "Fetch sleep summary (total/deep/light/REM/awake seconds, SpO2, respiration, stress, awake count — 16 metrics) for each day in a date range. Returns a JSON array or set format='csv' for longitudinal sleep analysis. Max 366 days per call."
+    )]
     async fn get_sleep_range(&self, Parameters(p): Parameters<DateRangeFormatParam>) -> String {
-        research::sleep_range(&self.api, &p.start_date, &p.end_date, p.format.unwrap_or_default()).await
+        research::sleep_range(
+            &self.api,
+            &p.start_date,
+            &p.end_date,
+            p.format.unwrap_or_default(),
+        )
+        .await
     }
 
-    #[tool(description = "Fetch HRV summary (weekly avg, last night, 5-min high/low, baseline, status, feedback) for each day in a date range. Returns a JSON array or set format='csv' for autonomic nervous system research. Days without HRV data appear as date-only rows. Max 366 days per call.")]
+    #[tool(
+        description = "Fetch HRV summary (weekly avg, last night, 5-min high/low, baseline, status, feedback) for each day in a date range. Returns a JSON array or set format='csv' for autonomic nervous system research. Days without HRV data appear as date-only rows. Max 366 days per call."
+    )]
     async fn get_hrv_range(&self, Parameters(p): Parameters<DateRangeFormatParam>) -> String {
-        research::hrv_range(&self.api, &p.start_date, &p.end_date, p.format.unwrap_or_default()).await
+        research::hrv_range(
+            &self.api,
+            &p.start_date,
+            &p.end_date,
+            p.format.unwrap_or_default(),
+        )
+        .await
     }
 
-    #[tool(description = "Compute per-ISO-week statistics (mean, std, min, max) of 12 key health metrics (steps, calories, HR, stress, body battery, SpO2, respiration) over a date range. Returns a JSON array with one object per week including week label, week_start/end dates, and stat columns. Max 366 days per call.")]
+    #[tool(
+        description = "Compute per-ISO-week statistics (mean, std, min, max) of 12 key health metrics (steps, calories, HR, stress, body battery, SpO2, respiration) over a date range. Returns a JSON array with one object per week including week label, week_start/end dates, and stat columns. Max 366 days per call."
+    )]
     async fn get_weekly_summary(&self, Parameters(p): Parameters<DateRangeParam>) -> String {
         research::weekly_summary(&self.api, &p.start_date, &p.end_date).await
     }
 
     // ---- Data Management (write operations) ----
 
-    #[tool(description = "Log hydration data for a date. value_in_ml is fluid intake in milliliters.")]
-    async fn add_hydration_data(
-        &self,
-        Parameters(p): Parameters<AddHydrationParams>,
-    ) -> String {
+    #[tool(
+        description = "Log hydration data for a date. value_in_ml is fluid intake in milliliters."
+    )]
+    async fn add_hydration_data(&self, Parameters(p): Parameters<AddHydrationParams>) -> String {
         data_management::add_hydration_data(&self.api, &p.date, p.value_in_ml).await
     }
 
-    #[tool(description = "Record a blood pressure measurement. date can be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS.")]
+    #[tool(
+        description = "Record a blood pressure measurement. date can be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS."
+    )]
     async fn set_blood_pressure(
         &self,
         Parameters(p): Parameters<SetBloodPressureParams>,
@@ -675,7 +750,9 @@ impl GarminMcpServer {
         .await
     }
 
-    #[tool(description = "Record body composition data (weight required; body fat %, muscle mass, bone mass optional). Weight in kg; masses in grams.")]
+    #[tool(
+        description = "Record body composition data (weight required; body fat %, muscle mass, bone mass optional). Weight in kg; masses in grams."
+    )]
     async fn add_body_composition(
         &self,
         Parameters(p): Parameters<AddBodyCompositionParams>,

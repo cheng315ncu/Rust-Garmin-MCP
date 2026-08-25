@@ -30,9 +30,9 @@ pub async fn get_menstrual_calendar_data(
             &data,
             &format!("No menstrual calendar data between {start_date} and {end_date}."),
         ),
-        Err(e) => format!(
-            "Error retrieving menstrual calendar from {start_date} to {end_date}: {e}"
-        ),
+        Err(e) => {
+            format!("Error retrieving menstrual calendar from {start_date} to {end_date}: {e}")
+        }
     }
 }
 

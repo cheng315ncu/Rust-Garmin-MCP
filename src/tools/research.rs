@@ -307,12 +307,7 @@ pub async fn sleep_range(
 /// Fetch HRV summary for each day in a date range.
 /// Days without HRV data appear as date-only rows.
 /// Returns a JSON array or CSV with 9 HRV columns per row.
-pub async fn hrv_range(
-    api: &GarminApiClient,
-    start: &str,
-    end: &str,
-    fmt: OutputFormat,
-) -> String {
+pub async fn hrv_range(api: &GarminApiClient, start: &str, end: &str, fmt: OutputFormat) -> String {
     let dates = match date_range_vec(start, end) {
         Ok(d) => d,
         Err(e) => return e,
@@ -408,10 +403,18 @@ pub async fn weekly_summary(api: &GarminApiClient, start: &str, end: &str) -> St
             Value::Number(rows.len().into()),
         );
 
-        if let Some(s) = rows.first().and_then(|r| r.get("date")).and_then(|v| v.as_str()) {
+        if let Some(s) = rows
+            .first()
+            .and_then(|r| r.get("date"))
+            .and_then(|v| v.as_str())
+        {
             w.insert("week_start".to_string(), Value::String(s.to_string()));
         }
-        if let Some(e) = rows.last().and_then(|r| r.get("date")).and_then(|v| v.as_str()) {
+        if let Some(e) = rows
+            .last()
+            .and_then(|r| r.get("date"))
+            .and_then(|v| v.as_str())
+        {
             w.insert("week_end".to_string(), Value::String(e.to_string()));
         }
 

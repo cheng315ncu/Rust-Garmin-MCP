@@ -19,10 +19,9 @@ pub async fn get_workouts(api: &GarminApiClient, start: u32, limit: u32) -> Stri
 pub async fn get_workout_by_id(api: &GarminApiClient, workout_id: &str) -> String {
     let endpoint = format!("/workout-service/workout/{}", workout_id);
     match api.api_json(&endpoint, None).await {
-        Ok(data) => crate::client::render_or_friendly(
-            &data,
-            &format!("Workout {workout_id} not found."),
-        ),
+        Ok(data) => {
+            crate::client::render_or_friendly(&data, &format!("Workout {workout_id} not found."))
+        }
         Err(e) => format!("Error retrieving workout {workout_id}: {e}"),
     }
 }
@@ -44,9 +43,9 @@ pub async fn get_scheduled_workouts(
             &data,
             &format!("No scheduled workouts between {start_date} and {end_date}."),
         ),
-        Err(e) => format!(
-            "Error retrieving scheduled workouts from {start_date} to {end_date}: {e}"
-        ),
+        Err(e) => {
+            format!("Error retrieving scheduled workouts from {start_date} to {end_date}: {e}")
+        }
     }
 }
 
@@ -58,11 +57,7 @@ pub async fn delete_workout(api: &GarminApiClient, workout_id: &str) -> String {
     }
 }
 
-pub async fn schedule_workout(
-    api: &GarminApiClient,
-    workout_id: &str,
-    date: &str,
-) -> String {
+pub async fn schedule_workout(api: &GarminApiClient, workout_id: &str, date: &str) -> String {
     let endpoint = format!("/workout-service/schedule/{}", workout_id);
     let body = serde_json::json!({ "date": date });
     match api.api_post_json(&endpoint, body).await {

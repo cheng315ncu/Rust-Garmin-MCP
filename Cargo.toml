@@ -1,6 +1,6 @@
 [package]
 name = "garmin-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -13,10 +13,24 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-garmin_client = "0.2"
 schemars = { version = "0.8", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json"] }
 moka = { version = "0.12", features = ["future"] }
 governor = "0.6"
 dotenvy = "0.15"
 chrono = "0.4"
+
+# Phase 3 Option B — DI OAuth2 + rquest TLS fingerprint impersonation.
+#
+# NOTE: `rquest` has been fully yanked from crates.io (all 5.x / 4.x / 3.x
+# versions), so it is pulled directly from the upstream git tag `v5.1.0`.
+# `rquest-util` 2.2.1 (still on crates.io) transitively depends on
+# `rquest >=3.0.5,<10`, which would fail to resolve against the yanked
+# crates.io entry — hence the `[patch.crates-io]` override below redirects
+# every `rquest` resolution (ours + rquest-util's) to the same git source.
+rquest = { git = "https://github.com/0x676e67/rquest.git", tag = "v5.1.0", features = ["json", "cookies"] }
+rquest-util = "2"
+base64 = "0.22"
+regex = "1"
+
+[patch.crates-io]
+rquest = { git = "https://github.com/0x676e67/rquest.git", tag = "v5.1.0" }

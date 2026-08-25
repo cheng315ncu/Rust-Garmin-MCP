@@ -39,10 +39,9 @@ pub async fn get_primary_training_device(api: &GarminApiClient) -> String {
         )
         .await
     {
-        Ok(data) => crate::client::render_or_friendly(
-            &data,
-            "No primary training device on this account.",
-        ),
+        Ok(data) => {
+            crate::client::render_or_friendly(&data, "No primary training device on this account.")
+        }
         Err(e) => format!("Error retrieving primary training device: {e}"),
     }
 }

@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use garmin_client::GarminClient;
+use anyhow::{Context, Result};
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
@@ -14,74 +13,99 @@ use moka::future::Cache;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::di_auth::{self, preview, DiSession};
+
 const API_BASE: &str = "https://connectapi.garmin.com";
+/// Garmin's mobile app version, sent on every connectapi request.
+const APP_VER: &str = "4.70.2.0";
+
+/// Absolute URL for a connectapi endpoint, with or without a leading slash
+/// (`connectapi.garmin.com//path` 404s).
+pub(crate) fn api_url(endpoint: &str) -> String {
+    format!("{}/{}", API_BASE, endpoint.trim_start_matches('/'))
+}
+
+/// The header set every authenticated connectapi request needs. Defined once so
+/// that bumping `X-app-ver` is a one-line change rather than a grep.
+pub(crate) fn garmin_headers(
+    req: rquest::RequestBuilder,
+    access_token: &str,
+) -> rquest::RequestBuilder {
+    req.header("Authorization", format!("Bearer {access_token}"))
+        .header("NK", "NT")
+        .header("X-app-ver", APP_VER)
+        .header("Accept", "application/json")
+}
 
 /// Max cached GET responses (LRU-evicted past this).
 const CACHE_MAX_ENTRIES: u64 = 1_000;
-/// TTL for cached GET responses.  60s coalesces "LLM re-asks the same
-/// question in the same conversation" without hiding fresh wearable data
-/// for long.  Tune via observation if researchers report stale reads.
+/// TTL for cached GET responses. 60s coalesces "LLM re-asks the same
+/// question in the same conversation" without hiding fresh wearable data.
 const CACHE_TTL_SECS: u64 = 60;
-/// Per-minute request budget against Garmin Connect.  Garmin does not
-/// document a hard limit; 60 req/min is a conservative starting point.
-/// Adjust by observation if tools begin failing with 429.
+/// Per-minute request budget against Garmin Connect. 60 req/min is a
+/// conservative starting point. Adjust if tools begin failing with 429.
 const RATE_LIMIT_PER_MIN: u32 = 60;
+/// First backoff step after a failed DI token refresh.
+const REFRESH_BACKOFF_MIN: Duration = Duration::from_secs(30);
+/// Ceiling for the exponential backoff between failed refresh attempts, so a
+/// long-lived server keeps checking occasionally instead of giving up.
+const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(900);
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
-/// Holds a bearer token together with its expiry epoch (seconds).
-struct BearerToken {
-    value: String,
-    expires_at: u64,
-}
-
-impl BearerToken {
-    fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now >= self.expires_at.saturating_sub(60) // 60-second safety margin
-    }
+/// Coordination state for DI access-token refresh.
+///
+/// Deliberately a separate lock from `RwLock<DiSession>`: it serialises the
+/// refresh (so concurrent callers make one network call, not N) *without*
+/// anyone holding the session lock across an await.  Holding the session write
+/// guard over the refresh means one stalled `diauth.garmin.com` connection
+/// blocks every request in the process, with no log line and no recovery.
+#[derive(Default)]
+struct RefreshState {
+    /// Earliest instant at which another refresh may be attempted.
+    next_attempt: Option<Instant>,
+    /// Consecutive failures; drives the exponential backoff.
+    failures: u32,
+    /// Set once the refresh token itself is dead, so that warning is printed
+    /// once rather than on every single request.
+    reported_dead: bool,
 }
 
 /// Shared Garmin API session.
 ///
-/// GET path layers (outermost → innermost):
+/// GET path layers (outermost -> innermost):
 ///
-///     moka cache  →  governor rate-limit  →  Mutex<GarminClient>  →  Garmin
+/// ```text
+/// moka cache  ->  governor rate-limit  ->  rquest GET  ->  Garmin
+/// ```
 ///
-///   * Cache hit  → return Arc<Value> immediately; no Mutex, no network.
-///   * Cache miss → moka's singleflight: only one task fetches, the rest
-///     await the same future.  After the rate-limit wait, the Mutex
-///     serialises the actual GarminClient call (the library is not
-///     Send-safe and api_request takes &mut).
-///   * Rate limit → applied to BOTH read and write paths so the per-minute
-///     budget covers all Garmin-bound traffic.
+///   * Cache hit  -> return Arc<Value> immediately; no network.
+///   * Cache miss -> moka's singleflight: only one task fetches, the rest
+///     await the same future.  After the rate-limit wait, the rquest GET
+///     carries the DI OAuth2 bearer token.
 ///
-/// Token (parallel to the above) lives behind Arc<RwLock<BearerToken>>:
-/// concurrent reads for the write path, exclusive refresh.  garmin_client
-/// only exposes GET, so POST/PUT/DELETE go through reqwest directly using
-/// the cached bearer token.
+/// Token lives behind `Arc<RwLock<DiSession>>`: concurrent reads for the
+/// request path, exclusive refresh when the access token nears expiry.
+/// The DI refresh token (~30 day lifetime) auto-renews the access token and
+/// the new session is persisted to `.di_session.json`.
 pub struct GarminApiClient {
-    inner: Arc<Mutex<GarminClient>>,
-    http: reqwest::Client,
-    token: Arc<RwLock<BearerToken>>,
+    http: rquest::Client,
+    token: Arc<RwLock<DiSession>>,
     pub display_name: String,
     /// Key: `endpoint?k1=v1&k2=v2` (params sorted).  Value: Arc<Value> so
     /// cache reads are Arc-bumps instead of full JSON deep-clones.
     cache: Cache<String, Arc<Value>>,
     /// Shared across api_json and api_write — one budget for all traffic.
     limiter: Arc<Limiter>,
+    /// Serialises token refresh and remembers failures; see `RefreshState`.
+    refresh: Arc<Mutex<RefreshState>>,
 }
 
 impl GarminApiClient {
-    pub fn new(
-        client: GarminClient,
-        display_name: String,
-        bearer_token: String,
-        token_expires_at: u64,
-    ) -> Self {
+    /// `http` is the process-wide impersonated client built in `auth.rs`, so
+    /// the API layer reuses the cookie jar and connection pool that the SSO
+    /// login warmed up.
+    pub fn new(http: rquest::Client, session: DiSession, display_name: String) -> Self {
         let cache = Cache::builder()
             .max_capacity(CACHE_MAX_ENTRIES)
             .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
@@ -92,22 +116,16 @@ impl GarminApiClient {
         )));
 
         Self {
-            inner: Arc::new(Mutex::new(client)),
-            http: reqwest::Client::builder()
-                .cookie_store(true) // mirror garmin_client behaviour
-                .build()
-                .expect("reqwest::Client build failed"),
-            token: Arc::new(RwLock::new(BearerToken {
-                value: bearer_token,
-                expires_at: token_expires_at,
-            })),
+            http,
+            token: Arc::new(RwLock::new(session)),
             display_name,
             cache,
             limiter,
+            refresh: Arc::new(Mutex::new(RefreshState::default())),
         }
     }
 
-    /// GET via garmin_client with TTL cache + singleflight + rate limit.
+    /// GET via rquest with TTL cache + singleflight + rate limit.
     ///
     /// Repeated calls within `CACHE_TTL_SECS` for the same (endpoint, params)
     /// return the cached Value without hitting Garmin.  Concurrent callers
@@ -119,9 +137,11 @@ impl GarminApiClient {
     ) -> Result<Value> {
         let key = build_cache_key(endpoint, params.as_ref());
 
-        // Clone Arc handles so the init future is 'static (moka requirement).
-        let inner = self.inner.clone();
+        // Clone handles so the init future is 'static (moka requirement).
+        let http = self.http.clone();
+        let token = self.token.clone();
         let limiter = self.limiter.clone();
+        let refresh = self.refresh.clone();
         let endpoint_owned = endpoint.trim_start_matches('/').to_string();
         let params_owned = params;
 
@@ -129,24 +149,37 @@ impl GarminApiClient {
             // Rate limit gates the actual network call; cache hits skip this.
             limiter.until_ready().await;
 
-            let mut guard = inner.lock().await;
+            // Refresh the DI access token if it is about to expire.
+            ensure_token_fresh(token.clone(), refresh).await;
 
-            let ok = match params_owned.as_ref() {
-                Some(p) => {
-                    let p_ref: HashMap<&str, &str> =
-                        p.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    guard
-                        .api_request(&endpoint_owned, Some(p_ref), true, None)
-                        .await
-                }
-                None => guard.api_request(&endpoint_owned, None, true, None).await,
-            };
+            let guard = token.read().await;
+            let access_token = guard.access_token.clone();
+            drop(guard); // release read lock before the network call
 
-            let text = guard.get_last_resp_text().to_string();
-            drop(guard); // release Mutex before parsing
+            let url = api_url(&endpoint_owned);
+            let mut req = garmin_headers(http.get(&url), &access_token);
 
-            if !ok {
-                anyhow::bail!("Garmin API GET to {} failed", endpoint_owned);
+            if let Some(p) = params_owned.as_ref() {
+                req = req.query(&p);
+            }
+
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Garmin API GET {url} failed"))?;
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .with_context(|| format!("Garmin API GET {url} body read failed"))?;
+
+            if !status.is_success() {
+                anyhow::bail!(
+                    "Garmin API GET to {} failed: {} {}",
+                    endpoint_owned,
+                    status,
+                    preview(&text)
+                );
             }
 
             if text.is_empty() {
@@ -175,7 +208,9 @@ impl GarminApiClient {
         match self.cache.try_get_with(key, init).await {
             Ok(arc) => Ok((*arc).clone()),
             // moka wraps init errors in Arc<E> so concurrent waiters share one.
-            Err(arc_err) => Err(anyhow::anyhow!("{}", arc_err)),
+            // `{:#}` so the `.with_context` chain above survives; plain `{}`
+            // prints only the outermost frame and deletes the real cause.
+            Err(arc_err) => Err(anyhow::anyhow!("{arc_err:#}")),
         }
     }
 
@@ -192,12 +227,11 @@ impl GarminApiClient {
         self.api_write("DELETE", endpoint, None).await
     }
 
-    /// POST / PUT / DELETE via reqwest (garmin_client is GET-only).
+    /// POST / PUT / DELETE via rquest.
     ///
     /// On success, invalidates the entire GET cache so the next read sees
     /// post-write state.  Per-key invalidation would be ideal but
-    /// write-endpoint → affected-read-endpoints is messy (e.g. POST /weight
-    /// affects /weight-service/weight/dateRange) and writes are rare.
+    /// write-endpoint -> affected-read-endpoints is messy and writes are rare.
     async fn api_write(&self, method: &str, endpoint: &str, body: Option<Value>) -> Result<Value> {
         // Writes count against the same per-minute budget as reads.
         self.limiter.until_ready().await;
@@ -205,32 +239,34 @@ impl GarminApiClient {
         self.refresh_token_if_needed().await;
 
         let token = self.token.read().await;
-        let auth_header = format!("Bearer {}", token.value);
+        let access_token = token.access_token.clone();
         drop(token); // release read lock before the network call
 
         let endpoint = endpoint.trim_start_matches('/');
-        let url = format!("{}/{}", API_BASE, endpoint);
+        let url = api_url(endpoint);
 
-        let mut req = match method {
+        let req = match method {
             "POST" => self.http.post(&url),
             "PUT" => self.http.put(&url),
             "DELETE" => self.http.delete(&url),
             _ => anyhow::bail!("unsupported HTTP method: {}", method),
         };
 
-        req = req
-            .header("Authorization", auth_header)
-            .header("NK", "NT")
-            .header("X-app-ver", "4.70.2.0")
-            .header("Accept", "application/json");
+        let mut req = garmin_headers(req, &access_token);
 
         if let Some(b) = body {
             req = req.json(&b);
         }
 
-        let resp = req.send().await?;
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("Garmin API {method} {url} failed"))?;
         let status = resp.status();
-        let text = resp.text().await?;
+        let text = resp
+            .text()
+            .await
+            .with_context(|| format!("Garmin API {method} {url} body read failed"))?;
 
         if !status.is_success() {
             anyhow::bail!(
@@ -238,7 +274,7 @@ impl GarminApiClient {
                 method,
                 endpoint,
                 status,
-                &text[..text.len().min(200)]
+                preview(&text)
             );
         }
 
@@ -254,49 +290,15 @@ impl GarminApiClient {
                 "parse error at {} {}: {e}; body: {}",
                 method,
                 endpoint,
-                &text[..text.len().min(200)]
+                preview(&text)
             )
         })
     }
 
-    /// Refresh the cached bearer token when it is about to expire.
-    ///
-    /// Limitation (unchanged): garmin_client does NOT rewrite the session
-    /// file after an in-process refresh — only on login.  Until upstream
-    /// fixes that, this only helps after a server restart.  Long-lived
-    /// daemons still die at the ~1-hour token lifetime.
+    /// Refresh the DI access token when it is about to expire, using the
+    /// refresh token, and persist the new session.
     async fn refresh_token_if_needed(&self) {
-        // Fast path: read lock — token is still valid.
-        {
-            let guard = self.token.read().await;
-            if !guard.is_expired() {
-                return;
-            }
-        }
-
-        // Slow path: upgrade to write lock (only one task proceeds).
-        let mut guard = self.token.write().await;
-
-        // Re-check under write lock.
-        if !guard.is_expired() {
-            return;
-        }
-
-        // Trigger garmin_client's internal OAuth refresh via a cheap GET.
-        {
-            let mut inner = self.inner.lock().await;
-            inner
-                .api_request("userprofile-service/userprofile", None, true, None)
-                .await;
-        }
-
-        if let Ok((new_token, new_exp)) = read_session_file() {
-            eprintln!("[client] bearer token refreshed (expires_at={new_exp})");
-            guard.value = new_token;
-            guard.expires_at = new_exp;
-        } else {
-            eprintln!("[client] warning: token expired but could not re-read session file");
-        }
+        ensure_token_fresh(self.token.clone(), self.refresh.clone()).await;
     }
 
     pub fn require_display_name(&self) -> std::result::Result<&str, String> {
@@ -308,10 +310,99 @@ impl GarminApiClient {
     }
 }
 
-/// Build a stable cache key from `endpoint` + sorted params.
+/// Free-function twin of `refresh_token_if_needed` usable from the 'static
+/// moka init future (which cannot borrow `&self`).
 ///
-/// HashMap iteration order is unspecified, so two identical calls would
-/// otherwise produce different keys and miss each other in the cache.
+/// The session `RwLock` is never held across the refresh network call.  The
+/// `refresh` mutex is what serialises concurrent callers, so exactly one
+/// refresh goes out; the session lock is taken only for the (non-await)
+/// expiry checks and the final store.
+async fn ensure_token_fresh(token: Arc<RwLock<DiSession>>, refresh: Arc<Mutex<RefreshState>>) {
+    // Fast path: token is still valid, no coordination needed.
+    if !token.read().await.is_expired() {
+        return;
+    }
+
+    // Slow path: one refresher at a time; everyone else waits here and then
+    // re-checks, because the holder may have just refreshed the token.
+    let mut state = refresh.lock().await;
+
+    let session = {
+        let guard = token.read().await;
+        if !guard.is_expired() {
+            return;
+        }
+        if !guard.refresh_is_valid() {
+            // No amount of retrying fixes a dead refresh token, so say it once.
+            if !state.reported_dead {
+                state.reported_dead = true;
+                eprintln!(
+                    "[client] warning: access token expired and the refresh token is no longer valid; restart to re-login"
+                );
+            }
+            return;
+        }
+        guard.clone()
+    };
+
+    // Back off after a failure instead of re-running the whole refresh (new
+    // client, CA bundle parse, POST) on every single request.
+    if state.next_attempt.is_some_and(|next| Instant::now() < next) {
+        return;
+    }
+
+    // Note the absence of any lock guard across this await.
+    match di_auth::refresh_di_token(&session).await {
+        Ok(new_session) => {
+            let expires_at = new_session.expires_at;
+            // A token that is already inside the 60s expiry margin would leave
+            // `is_expired()` true, so clearing the throttle here would turn the
+            // next request straight back into another refresh — a hot loop
+            // against Garmin's auth endpoint.
+            let still_expired = new_session.is_expired();
+
+            eprintln!("[client] DI access token refreshed (expires_at={expires_at})");
+            if let Err(e) = di_auth::save_session(&new_session) {
+                eprintln!("[client] warning: could not persist refreshed session: {e:#}");
+            }
+            *token.write().await = new_session;
+
+            if still_expired {
+                state.failures = state.failures.saturating_add(1);
+                let backoff = refresh_backoff(state.failures);
+                state.next_attempt = Some(Instant::now() + backoff);
+                eprintln!(
+                    "[client] warning: refreshed token is already expired (expires_at={expires_at}); next attempt in {}s",
+                    backoff.as_secs()
+                );
+            } else {
+                state.next_attempt = None;
+                state.failures = 0;
+                state.reported_dead = false;
+            }
+        }
+        Err(e) => {
+            state.failures = state.failures.saturating_add(1);
+            let backoff = refresh_backoff(state.failures);
+            state.next_attempt = Some(Instant::now() + backoff);
+            eprintln!(
+                "[client] warning: DI token refresh failed ({e:#}); next attempt in {}s",
+                backoff.as_secs()
+            );
+        }
+    }
+}
+
+/// Exponential backoff between failed refresh attempts: doubles per
+/// consecutive failure, capped at `REFRESH_BACKOFF_MAX`.
+fn refresh_backoff(failures: u32) -> Duration {
+    let steps = failures.saturating_sub(1).min(5);
+    REFRESH_BACKOFF_MIN
+        .saturating_mul(1 << steps)
+        .min(REFRESH_BACKOFF_MAX)
+}
+
+/// Build a stable cache key from `endpoint` + sorted params.
 fn build_cache_key(endpoint: &str, params: Option<&HashMap<String, String>>) -> String {
     let ep = endpoint.trim_start_matches('/');
     match params {
@@ -330,33 +421,10 @@ fn build_cache_key(endpoint: &str, params: Option<&HashMap<String, String>>) -> 
     }
 }
 
-/// Read (token_value, expires_at) from .garmin_session.json.
-/// Uses `.as_str()` — NOT `.to_string()` — to avoid garmin_client's
-/// re-quoting bug where the JWT becomes `"eyJ..."` (with quotes).
-pub fn read_session_file() -> Result<(String, u64)> {
-    let text = std::fs::read_to_string(".garmin_session.json")?;
-    let map: serde_json::Value = serde_json::from_str(&text)?;
-
-    let token = map["token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("token field missing in session file"))?
-        .to_string();
-
-    let expires_at = map["expires_at"]
-        .as_str()
-        .and_then(|s| s.parse::<u64>().ok())
-        .or_else(|| map["expires_at"].as_u64())
-        .unwrap_or(0);
-
-    Ok((token, expires_at))
-}
-
 /// Detect Garmin error envelopes that parsed as JSON (403/404/etc with body).
-/// Returns Some(short_message) when the value looks like an error envelope.
 pub fn detect_garmin_error(value: &Value) -> Option<String> {
     let obj = value.as_object()?;
 
-    // {status: 403, error: "Forbidden", message: "..."}
     if let Some(status) = obj.get("status").and_then(Value::as_u64) {
         if (400..600).contains(&status) {
             let kind = obj
@@ -372,7 +440,6 @@ pub fn detect_garmin_error(value: &Value) -> Option<String> {
         }
     }
 
-    // {exception: "ForbiddenException", ...}
     if let Some(exc) = obj.get("exception").and_then(Value::as_str) {
         let msg = obj
             .get("errorMessage")
@@ -386,8 +453,6 @@ pub fn detect_garmin_error(value: &Value) -> Option<String> {
         });
     }
 
-    // {error: "NotAllowedException", clientMessage: "...", errorId: "..."}
-    // Garmin uses this shape when the account doesn't have access to a feature.
     if let Some(err) = obj.get("error").and_then(Value::as_str) {
         if err.ends_with("Exception") || obj.contains_key("errorId") {
             let hint = obj
@@ -403,7 +468,6 @@ pub fn detect_garmin_error(value: &Value) -> Option<String> {
         }
     }
 
-    // {errorMessage: "..."}（no status / exception field）
     if let Some(msg) = obj.get("errorMessage").and_then(Value::as_str) {
         return Some(msg.to_string());
     }
@@ -421,4 +485,71 @@ pub fn render_or_friendly(data: &Value, no_data_msg: &str) -> String {
         return format!("{no_data_msg}（API 訊息：{err}）");
     }
     serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("Error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_sorts_params_so_call_order_does_not_split_the_cache() {
+        let mut a = HashMap::new();
+        a.insert("b".to_string(), "2".to_string());
+        a.insert("a".to_string(), "1".to_string());
+
+        assert_eq!(build_cache_key("/x/y", Some(&a)), "x/y?a=1&b=2");
+        assert_eq!(build_cache_key("/x/y", None), "x/y");
+        assert_eq!(build_cache_key("x/y", Some(&HashMap::new())), "x/y");
+    }
+
+    #[test]
+    fn api_url_tolerates_a_leading_slash() {
+        // `connectapi.garmin.com//path` 404s.
+        assert_eq!(api_url("/a/b"), format!("{API_BASE}/a/b"));
+        assert_eq!(api_url("a/b"), format!("{API_BASE}/a/b"));
+    }
+
+    #[test]
+    fn refresh_backoff_grows_then_caps() {
+        assert_eq!(refresh_backoff(1), REFRESH_BACKOFF_MIN);
+        assert_eq!(refresh_backoff(2), REFRESH_BACKOFF_MIN * 2);
+        assert_eq!(refresh_backoff(3), REFRESH_BACKOFF_MIN * 4);
+        assert_eq!(refresh_backoff(99), REFRESH_BACKOFF_MAX);
+        // Never zero — a zero backoff would restore the hot-loop this fixes.
+        assert!(refresh_backoff(0) >= REFRESH_BACKOFF_MIN);
+    }
+
+    #[test]
+    fn garmin_error_envelopes_are_detected() {
+        let http = serde_json::json!({"status": 404, "error": "Not Found", "message": "no data"});
+        assert_eq!(
+            detect_garmin_error(&http).as_deref(),
+            Some("HTTP 404 Not Found: no data")
+        );
+
+        let exc = serde_json::json!({"exception": "NotAllowedException", "errorMessage": "gated"});
+        assert_eq!(
+            detect_garmin_error(&exc).as_deref(),
+            Some("NotAllowedException: gated")
+        );
+
+        // A normal payload must not be mistaken for an error envelope.
+        assert_eq!(
+            detect_garmin_error(&serde_json::json!({"steps": 1200})),
+            None
+        );
+        assert_eq!(
+            detect_garmin_error(&serde_json::json!({"status": 200})),
+            None
+        );
+    }
+
+    #[test]
+    fn render_or_friendly_explains_absence_instead_of_printing_null() {
+        assert_eq!(
+            render_or_friendly(&Value::Null, "no data for 2026-01-01"),
+            "no data for 2026-01-01"
+        );
+        assert!(render_or_friendly(&serde_json::json!({"steps": 1}), "x").contains("\"steps\""));
+    }
 }
