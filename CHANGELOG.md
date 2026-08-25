@@ -39,6 +39,16 @@ TLS-impersonation crate.
   library without depending on the binary.
 - **Connection integration test** (`tests/connection.rs`, `#[ignore]`d by
   default) that exercises the live auth + API path.
+- **Unit tests** for the SSO HTML parsers, `parse_di_session`, the cached-session
+  account gate, the cache key, and the refresh backoff. `cargo test` previously
+  ran nothing, since the only test in the repo was the ignored live one.
+- **Account binding** on the session cache: `DiSession` records the account it
+  was minted for, and a cached session is not reused when `GARMIN_EMAIL`
+  changes.
+- **`GARMIN_SESSION_FILE`** to pin the session cache path, for stdio servers
+  launched with an arbitrary working directory.
+- **`.env.example`**, which `.gitignore` had a `!.env.example` exception for but
+  which never existed.
 
 ### Changed
 
@@ -58,6 +68,8 @@ TLS-impersonation crate.
 ### Removed
 
 - `garmin_client` and `reqwest` dependencies.
+- The "Known `garmin_client 0.2.1` bugs" README section, along with the rest of
+  the pre-refactor documentation it belonged to.
 
 ### Fixed
 
@@ -65,6 +77,59 @@ TLS-impersonation crate.
   caused by Garmin's March 2026 Cloudflare TLS-fingerprinting rollout.
 - MFA code trailing-newline bug from the old `garmin_client` handler (codes are
   now trimmed).
+- **User-Agent contradicted the TLS fingerprint.** `.user_agent()` was chained
+  after `.emulation()`, which replaces only the `User-Agent` entry, so requests
+  carried a Chrome 131 / Android JA3 + HTTP2 fingerprint and `sec-ch-ua`
+  client hints under an iPhone Safari UA. The override is still needed —
+  rquest-util 2.2.1's own literal for this arm is malformed — but it now carries
+  a real Chrome 131 Android string.
+- **A stalled token refresh could hang the whole server.** The DI clients set no
+  request timeout (rquest defaults to none) and the refresh was awaited while
+  holding the session write lock, so one half-open connection to
+  `diauth.garmin.com` blocked every request permanently and silently. There is
+  now a 30-second timeout, and refresh is serialised by a dedicated mutex so the
+  session lock is never held across an await.
+- **A rejected refresh token was retried on every single request**, each time
+  rebuilding a client and re-parsing the CA bundle. Failures now back off
+  exponentially (30s to 15min) and report once.
+- **`refresh_token` is optional on a refresh** (RFC 6749 §6); treating it as
+  mandatory would have broken every refresh had Garmin disabled rotation. The
+  previous token and its real expiry are carried forward instead — an absent
+  `refresh_expires_in` no longer silently re-extends the believed window by 30
+  days.
+- **A cached session outlived its credentials.** Changing `GARMIN_EMAIL` kept
+  serving the previous account's health data for the ~30 day refresh lifetime,
+  because layer 1 never consulted the environment.
+- **Connection pooling was disabled**, not merely capped: `pool_max_idle_per_host(0)`
+  turns rquest's pool off, so every request paid a fresh TCP + BoringSSL +
+  Chrome-emulation handshake — 366 of them for a year-long research range. A
+  30-second `pool_idle_timeout` covers the stale-socket case it was guarding.
+- **Three impersonated clients meant three cookie jars**, so the Cloudflare
+  `__cflb` cookie earned during SSO never reached `connectapi`. One client is now
+  shared across login, the display-name probe, and all API traffic — which also
+  removes a `.expect()` panic that fired after a completed MFA login, and a
+  silent fallback to a bare `rquest::Client` with no CA store, no emulation and
+  no redirect policy.
+- **The `_csrf` and ticket regexes were stricter than Garmin's markup.** `\w+`
+  rejects base64- and UUID-shaped tokens outright (the match fails, it does not
+  truncate), and requiring `value` directly after `name` breaks on attribute
+  reordering or single quotes. The ticket pattern likewise now stops at `'`,
+  whitespace, `<` and `\`.
+- **An environment variable set to the empty string counted as provided**,
+  skipping the `_FILE` and stdin fallbacks and submitting an empty credential.
+- **`read_mfa_code` blocked the async runtime** for up to five minutes, freezing
+  the current-thread runtime the integration test uses; it now runs on
+  `spawn_blocking`. The injected code file is deleted only after Garmin accepts
+  the code, instead of at read time.
+- **`.di_session.json` was created world-readable** (0644 via `fs::write`) while
+  holding a ~30 day refresh token; it is now 0600. A failed write no longer
+  aborts authentication outright, discarding a session that cost a full MFA
+  round trip.
+- **Error messages dropped their cause.** `{}` on an `anyhow::Error` prints only
+  the outermost frame, deleting the `.with_context` chain; `{:#}` is used
+  throughout now, and the write path gained the context it was missing.
+- **`sso_login` emitted no diagnostics**, despite the module documentation
+  pointing at its traces as the way to diagnose a Garmin markup change.
 
 ## [0.1.2] - 2026
 
