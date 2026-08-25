@@ -29,20 +29,26 @@ const DI_CLIENT_IDS: &[&str] = &[
     "GARMIN_CONNECT_MOBILE_ANDROID_DI",
 ];
 
-/// User-Agent for every impersonated request.  It must agree with the TLS /
-/// HTTP2 fingerprint of `Emulation::Chrome131` + `EmulationOS::Android` and
-/// with the `sec-ch-ua*` client hints that emulation installs, or the three
-/// together are a stronger bot signal than no emulation at all.
+/// User-Agent for every impersonated request.
 ///
-/// We override the emulation's own UA because rquest-util 2.2.1 ships a
-/// malformed literal for this arm — `Mozilla/5.0 (Linux: Android 10; K) …
-/// Chrome/131.0.0.0 Safari/537.36`, with a colon after `Linux` and no `Mobile`
-/// token (see `rquest-util/src/emulation/device/chrome.rs`, the `v131` Android
-/// tuple).  The string below is what real Chrome 131 on Android sends.
+/// **This deliberately does NOT match the emulated fingerprint, and that is
+/// load-bearing — do not "fix" it.**  The client presents a Chrome 131 /
+/// Android JA3 + HTTP2 fingerprint and Chrome `sec-ch-ua*` hints, under a
+/// mobile Safari UA.  The obvious tidy-up is to send a matching
+/// Chrome-131-on-Android UA instead.  That was tried against the live service:
+/// the credential POST comes back as the sign-in page again with
+/// `<div id="status" class="error">An unexpected error has occurred.</div>`,
+/// while this UA reaches the MFA page normally.  Same code, same credentials,
+/// one string changed.
+///
+/// (For the record, the emulation's own literal cannot be used either:
+/// rquest-util 2.2.1's `v131` Android tuple is malformed — `Linux:` for
+/// `Linux;`, and no `Mobile` token.  See
+/// `rquest-util/src/emulation/device/chrome.rs`.)
 ///
 /// Order matters: `.user_agent()` must stay AFTER `.emulation()`.  `emulation()`
 /// `mem::swap`s the whole header map, so a UA set before it is discarded.
-const USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+const USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
 
 /// Request timeout for every Garmin HTTP call.  rquest's builder default is
 /// `timeout: None`; an unbounded DI refresh is what wedges the client layer.
@@ -248,6 +254,33 @@ static CSRF_RES: LazyLock<[Regex; 2]> = LazyLock::new(|| {
 static TICKET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[?&]ticket=([^"'&\s<\\]+)"#).expect("valid ticket regex"));
 
+/// The visible error banner on a failed sign-in page.
+///
+/// Worth having because the page title is identical on success-so-far and on
+/// failure ("GARMIN Authentication Application"), and a 200-character body
+/// preview is entirely `<!DOCTYPE html>` boilerplate.  This is the difference
+/// between "Invalid sign in. (Passwords are case sensitive.)" — wrong password
+/// — and "An unexpected error has occurred." — Garmin rejected the request
+/// itself, so look at headers and fingerprint, not credentials.
+static STATUS_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<div[^>]*id=["']status["'][^>]*class=["'][^"']*error[^"']*["'][^>]*>(.*?)</div>"#)
+        .expect("valid status error regex")
+});
+
+fn extract_status_error(html: &str) -> Option<String> {
+    let raw = STATUS_ERROR_RE
+        .captures(html)
+        .and_then(|c| c.get(1).map(|m| m.as_str()))?;
+    // The banner can carry nested markup; keep only the text.
+    let text = Regex::new(r"(?s)<[^>]*>")
+        .ok()?
+        .replace_all(raw, " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
 /// Extract the first `<title>...</title>` value from an HTML document.
 fn extract_title(html: &str) -> Option<String> {
     TITLE_RE
@@ -372,7 +405,10 @@ pub async fn sso_login(
     // 5. Hard error on anything other than Success.
     if title != "Success" {
         eprintln!("[di_auth] signin body preview: {}", preview(&body));
-        bail!("Garmin SSO login failed (page title: {title:?})");
+        match extract_status_error(&body) {
+            Some(err) => bail!("Garmin SSO login failed: {err} (page title: {title:?})"),
+            None => bail!("Garmin SSO login failed (page title: {title:?})"),
+        }
     }
 
     // 6. Install the Cloudflare LB cookie.
@@ -874,6 +910,33 @@ mod tests {
             client_id: "CID".into(),
             account: Some("alice@example.com".into()),
         }
+    }
+
+    #[test]
+    fn status_error_banner_is_extracted() {
+        // The two cases that mean completely different things, both rendered
+        // under the same page title.
+        let bad_password = r#"<div id="status" class="error">Invalid sign in. (Passwords are case sensitive.)</div>"#;
+        assert_eq!(
+            extract_status_error(bad_password).as_deref(),
+            Some("Invalid sign in. (Passwords are case sensitive.)")
+        );
+
+        let rejected = "<div id=\"status\" class=\"status error\">\n  An unexpected <b>error</b>\n  has occurred.\n</div>";
+        assert_eq!(
+            extract_status_error(rejected).as_deref(),
+            Some("An unexpected error has occurred.")
+        );
+
+        // The same div with no error class, and an empty banner, are not errors.
+        assert_eq!(
+            extract_status_error(r#"<div id="status" class="ok">fine</div>"#),
+            None
+        );
+        assert_eq!(
+            extract_status_error(r#"<div id="status" class="error"></div>"#),
+            None
+        );
     }
 
     #[test]

@@ -77,12 +77,12 @@ TLS-impersonation crate.
   caused by Garmin's March 2026 Cloudflare TLS-fingerprinting rollout.
 - MFA code trailing-newline bug from the old `garmin_client` handler (codes are
   now trimmed).
-- **User-Agent contradicted the TLS fingerprint.** `.user_agent()` was chained
-  after `.emulation()`, which replaces only the `User-Agent` entry, so requests
-  carried a Chrome 131 / Android JA3 + HTTP2 fingerprint and `sec-ch-ua`
-  client hints under an iPhone Safari UA. The override is still needed —
-  rquest-util 2.2.1's own literal for this arm is malformed — but it now carries
-  a real Chrome 131 Android string.
+- **`sso_login` failures now name the reason.** The page title is the same on a
+  rejected sign-in as on a successful one, so a failure reported only
+  `page title: "GARMIN Authentication Application"`. The visible error banner is
+  extracted instead, which distinguishes "Invalid sign in. (Passwords are case
+  sensitive.)" (wrong credentials) from "An unexpected error has occurred."
+  (Garmin rejected the request itself).
 - **A stalled token refresh could hang the whole server.** The DI clients set no
   request timeout (rquest defaults to none) and the refresh was awaited while
   holding the session write lock, so one half-open connection to

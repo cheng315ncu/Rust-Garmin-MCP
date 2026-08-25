@@ -69,8 +69,10 @@ method's own doc comment, though the SSO POST 302s to the MFA page. Do not set
 `pool_idle_timeout` is what guards against Garmin dropping idle sockets.
 
 The `USER_AGENT` override must stay **after** `.emulation()`, which `mem::swap`s the whole header
-map. It exists because rquest-util's own Chrome-131-Android literal is malformed; whatever replaces
-it must still agree with the emulated TLS/HTTP2 fingerprint and the `sec-ch-ua*` hints.
+map. **It deliberately does not match the emulated fingerprint** — a mobile Safari UA over a Chrome
+131 / Android TLS fingerprint. Making them agree looks obviously correct and breaks the login:
+tested live, a Chrome-131-Android UA gets the credential POST bounced back as the sign-in page with
+"An unexpected error has occurred.", while the Safari UA reaches the MFA page. Don't tidy it.
 
 Both call `system_cert_store()` to load the OS CA bundle, because BoringSSL's built-in webpki roots
 won't contain a proxy/VPN's intercepting CA. It is parsed once behind a `OnceLock`.
