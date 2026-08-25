@@ -4,7 +4,7 @@ use crate::client::{self, GarminApiClient};
 use crate::di_auth;
 use crate::tools::GarminMcpServer;
 
-pub async fn create_garmin_server() -> Result<GarminMcpServer> {
+pub async fn create_garmin_client() -> Result<GarminApiClient> {
     let _ = dotenvy::dotenv();
 
     // One impersonated client for the whole process. The SSO login, the
@@ -23,7 +23,11 @@ pub async fn create_garmin_server() -> Result<GarminMcpServer> {
         eprintln!("Logged in as: {display_name}");
     }
 
-    let api = GarminApiClient::new(http, session, display_name);
+    Ok(GarminApiClient::new(http, session, display_name))
+}
+
+pub async fn create_garmin_server() -> Result<GarminMcpServer> {
+    let api = create_garmin_client().await?;
     Ok(GarminMcpServer::new(api))
 }
 

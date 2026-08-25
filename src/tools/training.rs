@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use crate::client::GarminApiClient;
 
 pub async fn training_status(api: &GarminApiClient, date: &str) -> String {
-    let endpoint = format!("/metrics-service/metrics/trainingstatus/aggregated/{}", date);
+    let endpoint = format!(
+        "/metrics-service/metrics/trainingstatus/aggregated/{}",
+        date
+    );
     match api.api_json(&endpoint, None).await {
-        Ok(data) => {
-            serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}"))
-        }
+        Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
         Err(e) => format!("Error retrieving training status for {date}: {e}"),
     }
 }
@@ -34,9 +35,7 @@ pub async fn progress_summary(
         .await
     {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
-        Err(e) => format!(
-            "Error retrieving progress summary from {start_date} to {end_date}: {e}"
-        ),
+        Err(e) => format!("Error retrieving progress summary from {start_date} to {end_date}: {e}"),
     }
 }
 
@@ -45,10 +44,7 @@ pub async fn race_predictions(api: &GarminApiClient) -> String {
         Ok(n) => n.to_string(),
         Err(e) => return e,
     };
-    let endpoint = format!(
-        "/fitnessstats-service/statistics/racePredictions/{}",
-        name
-    );
+    let endpoint = format!("/fitnessstats-service/statistics/racePredictions/{}", name);
     match api.api_json(&endpoint, None).await {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
         Err(e) => format!("Error retrieving race predictions: {e}"),

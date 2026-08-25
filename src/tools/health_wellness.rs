@@ -40,7 +40,9 @@ pub async fn sleep_summary(api: &GarminApiClient, date: &str, fmt: OutputFormat)
             let dto = data.get("dailySleepDTO").unwrap_or(&data);
             let fields = pluck_into_map(dto, SLEEP_FIELDS);
             if fields.len() <= 1 {
-                return format!("No sleep data for {date} — watch may not have been worn that night.");
+                return format!(
+                    "No sleep data for {date} — watch may not have been worn that night."
+                );
             }
             FlatSummary { fields }.render(fmt)
         }
@@ -157,13 +159,15 @@ pub async fn body_battery_events(api: &GarminApiClient, date: &str) -> String {
         ("endDate".to_string(), date.to_string()),
     ]);
     match api
-        .api_json("/wellness-service/wellness/bodyBattery/events", Some(params))
+        .api_json(
+            "/wellness-service/wellness/bodyBattery/events",
+            Some(params),
+        )
         .await
     {
-        Ok(data) => crate::client::render_or_friendly(
-            &data,
-            &format!("No body battery events for {date}."),
-        ),
+        Ok(data) => {
+            crate::client::render_or_friendly(&data, &format!("No body battery events for {date}."))
+        }
         Err(e) => format!("Error retrieving body battery events for {date}: {e}"),
     }
 }
@@ -202,10 +206,7 @@ pub async fn blood_pressure(
 }
 
 pub async fn floors(api: &GarminApiClient, date: &str) -> String {
-    let endpoint = format!(
-        "/wellness-service/wellness/floorsChartData/daily/{}",
-        date
-    );
+    let endpoint = format!("/wellness-service/wellness/floorsChartData/daily/{}", date);
     match api.api_json(&endpoint, None).await {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
         Err(e) => format!("Error retrieving floors for {date}: {e}"),
@@ -230,10 +231,7 @@ pub async fn rhr_day(api: &GarminApiClient, date: &str) -> String {
 }
 
 pub async fn hydration_data(api: &GarminApiClient, date: &str) -> String {
-    let endpoint = format!(
-        "/usersummary-service/usersummary/hydration/daily/{}",
-        date
-    );
+    let endpoint = format!("/usersummary-service/usersummary/hydration/daily/{}", date);
     match api.api_json(&endpoint, None).await {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
         Err(e) => format!("Error retrieving hydration data for {date}: {e}"),
@@ -276,9 +274,10 @@ pub async fn all_day_events(api: &GarminApiClient, date: &str) -> String {
 pub async fn hrv_data(api: &GarminApiClient, date: &str, fmt: OutputFormat) -> String {
     let endpoint = format!("/hrv-service/hrv/{}", date);
     match api.api_json(&endpoint, None).await {
-        Ok(data) if data.is_null()
-            || crate::client::detect_garmin_error(&data).is_some()
-            || data.get("hrvSummary").is_none() =>
+        Ok(data)
+            if data.is_null()
+                || crate::client::detect_garmin_error(&data).is_some()
+                || data.get("hrvSummary").is_none() =>
         {
             format!("No HRV data for {date} — HRV tracking requires sleeping with an HRV-capable watch.")
         }
@@ -319,7 +318,10 @@ pub async fn fitnessage_data(api: &GarminApiClient, date: &str) -> String {
 pub async fn endurance_score(api: &GarminApiClient, date: &str) -> String {
     let params = HashMap::from([("calendarDate".to_string(), date.to_string())]);
     match api
-        .api_json("/metrics-service/metrics/enduranceScore/detail", Some(params))
+        .api_json(
+            "/metrics-service/metrics/enduranceScore/detail",
+            Some(params),
+        )
         .await
     {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
@@ -341,7 +343,10 @@ pub async fn hill_score(api: &GarminApiClient, date: &str) -> String {
 pub async fn lactate_threshold(api: &GarminApiClient, date: &str) -> String {
     let params = HashMap::from([("calendarDate".to_string(), date.to_string())]);
     match api
-        .api_json("/metrics-service/metrics/lactateThreshold/detail", Some(params))
+        .api_json(
+            "/metrics-service/metrics/lactateThreshold/detail",
+            Some(params),
+        )
         .await
     {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
@@ -419,7 +424,10 @@ const STATS_FIELDS: &[(&str, &str)] = &[
     ("minHeartRate", "min_heart_rate_bpm"),
     ("maxHeartRate", "max_heart_rate_bpm"),
     ("restingHeartRate", "resting_heart_rate_bpm"),
-    ("lastSevenDaysAvgRestingHeartRate", "last_7_days_avg_resting_hr"),
+    (
+        "lastSevenDaysAvgRestingHeartRate",
+        "last_7_days_avg_resting_hr",
+    ),
     ("averageStressLevel", "avg_stress_level"),
     ("maxStressLevel", "max_stress_level"),
     ("stressQualifier", "stress_qualifier"),
@@ -464,7 +472,10 @@ const HEART_RATE_FIELDS: &[(&str, &str)] = &[
     ("restingHeartRate", "resting_heart_rate_bpm"),
     ("maxHeartRate", "max_heart_rate_bpm"),
     ("minHeartRate", "min_heart_rate_bpm"),
-    ("lastSevenDaysAvgRestingHeartRate", "last_7_days_avg_resting_hr"),
+    (
+        "lastSevenDaysAvgRestingHeartRate",
+        "last_7_days_avg_resting_hr",
+    ),
     ("startTimestampLocal", "start_local"),
     ("endTimestampLocal", "end_local"),
 ];

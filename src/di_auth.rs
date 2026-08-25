@@ -9,8 +9,8 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use regex::Regex;
 use rquest_util::{Emulation, EmulationOS, EmulationOption};
 use serde::{Deserialize, Serialize};
@@ -311,7 +311,11 @@ fn extract_ticket(html: &str) -> Result<String> {
 /// GET the embed page that seeds the SSO cookies before the sign-in flow.
 async fn prime_embed_cookies(client: &rquest::Client) -> Result<()> {
     let url = "https://sso.garmin.com/sso/embed?id=gauth-widget&embedWidget=true&gauthHost=https://sso.garmin.com/sso/embed";
-    let resp = client.get(url).send().await.context("embed prime GET failed")?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .context("embed prime GET failed")?;
     let _ = resp.text().await.context("embed prime body read failed")?;
     Ok(())
 }
@@ -500,11 +504,7 @@ pub async fn exchange_service_ticket(ticket: &str) -> Result<DiSession> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no DI client IDs configured")))
 }
 
-async fn try_exchange(
-    client: &rquest::Client,
-    client_id: &str,
-    ticket: &str,
-) -> Result<DiSession> {
+async fn try_exchange(client: &rquest::Client, client_id: &str, ticket: &str) -> Result<DiSession> {
     let basic = STANDARD.encode(format!("{client_id}:"));
     let form = [
         ("client_id", client_id.to_string()),

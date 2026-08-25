@@ -23,14 +23,8 @@ pub async fn get_full_name(api: &GarminApiClient) -> String {
         .await
     {
         Ok(data) => {
-            let first = data
-                .get("firstName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let last = data
-                .get("lastName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let first = data.get("firstName").and_then(|v| v.as_str()).unwrap_or("");
+            let last = data.get("lastName").and_then(|v| v.as_str()).unwrap_or("");
             let display = data
                 .get("displayName")
                 .and_then(|v| v.as_str())

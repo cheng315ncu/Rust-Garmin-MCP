@@ -39,7 +39,10 @@ pub async fn activities_by_date(
     }
 
     if all.is_empty() {
-        return format!("No activities found between {} and {}", start_date, end_date);
+        return format!(
+            "No activities found between {} and {}",
+            start_date, end_date
+        );
     }
 
     let curated: Vec<Value> = all.iter().map(curate_activity).collect();
@@ -139,7 +142,10 @@ pub async fn activity_exercise_sets(api: &GarminApiClient, activity_id: &str) ->
 
 pub async fn activity_gear(api: &GarminApiClient, activity_id: &str) -> String {
     let params = HashMap::from([("activityId".to_string(), activity_id.to_string())]);
-    match api.api_json("/gear-service/gear/filterGear", Some(params)).await {
+    match api
+        .api_json("/gear-service/gear/filterGear", Some(params))
+        .await
+    {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
         Err(e) => format!("Error retrieving gear for activity {activity_id}: {e}"),
     }
@@ -154,14 +160,20 @@ pub async fn activity_training_effect(api: &GarminApiClient, activity_id: &str) 
 }
 
 pub async fn count_activities(api: &GarminApiClient) -> String {
-    match api.api_json("/activitylist-service/activities/count", None).await {
+    match api
+        .api_json("/activitylist-service/activities/count", None)
+        .await
+    {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
         Err(e) => format!("Error retrieving activity count: {e}"),
     }
 }
 
 pub async fn activity_types(api: &GarminApiClient) -> String {
-    match api.api_json("/activity-service/activity/activityTypes", None).await {
+    match api
+        .api_json("/activity-service/activity/activityTypes", None)
+        .await
+    {
         Ok(data) => serde_json::to_string_pretty(&data).unwrap_or_else(|e| format!("Error: {e}")),
         Err(e) => format!("Error retrieving activity types: {e}"),
     }

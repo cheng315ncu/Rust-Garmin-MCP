@@ -37,10 +37,7 @@ pub async fn get_custom_foods(api: &GarminApiClient) -> String {
         .api_json("/nutrition-service/nutrition/foods/user", None)
         .await
     {
-        Ok(data) => crate::client::render_or_friendly(
-            &data,
-            "No custom foods saved.",
-        ),
+        Ok(data) => crate::client::render_or_friendly(&data, "No custom foods saved."),
         Err(e) => format!("Error retrieving custom foods: {e}"),
     }
 }

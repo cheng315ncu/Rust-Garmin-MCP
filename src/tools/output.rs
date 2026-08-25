@@ -102,8 +102,7 @@ impl ClinicalExport for HrvPayload {
         if let Some(last) = self.readings.last().and_then(|r| r.get("readingTimeGMT")) {
             out.insert("last_reading_gmt".to_string(), last.clone());
         }
-        serde_json::to_string_pretty(&Value::Object(out))
-            .unwrap_or_else(|e| format!("Error: {e}"))
+        serde_json::to_string_pretty(&Value::Object(out)).unwrap_or_else(|e| format!("Error: {e}"))
     }
 
     fn to_csv(&self) -> String {
@@ -113,10 +112,7 @@ impl ClinicalExport for HrvPayload {
                 .get("readingTimeGMT")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let v = r
-                .get("value")
-                .map(value_to_csv_cell)
-                .unwrap_or_default();
+            let v = r.get("value").map(value_to_csv_cell).unwrap_or_default();
             out.push_str(&csv_quote(t));
             out.push(',');
             out.push_str(&v);
@@ -154,13 +150,15 @@ impl ClinicalExport for TimeseriesArray {
             Value::Number(self.samples.len().into()),
         );
         if let Some((ts, _)) = self.samples.first() {
-            out.insert("first_sample_ts_ms".to_string(), Value::Number((*ts).into()));
+            out.insert(
+                "first_sample_ts_ms".to_string(),
+                Value::Number((*ts).into()),
+            );
         }
         if let Some((ts, _)) = self.samples.last() {
             out.insert("last_sample_ts_ms".to_string(), Value::Number((*ts).into()));
         }
-        serde_json::to_string_pretty(&Value::Object(out))
-            .unwrap_or_else(|e| format!("Error: {e}"))
+        serde_json::to_string_pretty(&Value::Object(out)).unwrap_or_else(|e| format!("Error: {e}"))
     }
 
     fn to_csv(&self) -> String {
@@ -192,8 +190,7 @@ pub struct EventTable {
 impl ClinicalExport for EventTable {
     fn to_json(&self) -> String {
         let array: Vec<Value> = self.rows.iter().cloned().map(Value::Object).collect();
-        serde_json::to_string_pretty(&Value::Array(array))
-            .unwrap_or_else(|e| format!("Error: {e}"))
+        serde_json::to_string_pretty(&Value::Array(array)).unwrap_or_else(|e| format!("Error: {e}"))
     }
 
     fn to_csv(&self) -> String {
