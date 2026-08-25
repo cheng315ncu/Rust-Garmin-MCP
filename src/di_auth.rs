@@ -3,7 +3,8 @@
 //! Replaces the deprecated `garmin_client` (garth-based) SSO flow that broke
 //! when Garmin enabled Cloudflare TLS fingerprinting in March 2026.
 
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -46,6 +47,13 @@ const USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 
 /// Request timeout for every Garmin HTTP call.  rquest's builder default is
 /// `timeout: None`; an unbounded DI refresh is what wedges the client layer.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an idle pooled connection may be reused. Short, because Garmin and
+/// Cloudflare drop server-side sockets well before rquest's 90s default.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long `read_mfa_code` polls `GARMIN_MFA_CODE_FILE` before giving up.
+const MFA_WAIT: Duration = Duration::from_secs(300);
 
 /// Fallback access-token lifetime when the DI response omits `expires_in`.
 const DEFAULT_ACCESS_TTL_SECS: u64 = 3_600;
@@ -107,27 +115,36 @@ fn now_secs() -> u64 {
 /// CA — BoringSSL's built-in webpki roots won't include that CA, but the
 /// system bundle (`/etc/ssl/certs/ca-certificates.crt` on Debian/Ubuntu)
 /// does.
-fn system_cert_store() -> Option<rquest::tls::CertStore> {
-    const CA_PATHS: &[&str] = &[
-        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
-        "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/Fedora
-        "/etc/ssl/cert.pem",                  // macOS / Alpine
-    ];
-    for path in CA_PATHS {
-        if let Ok(store) = rquest::tls::CertStore::from_pem_file(path) {
-            eprintln!("[di_auth] loaded system CA bundle from {path}");
-            return Some(store);
-        }
-    }
-    eprintln!("[di_auth] warning: no system CA bundle found; TLS verification may fail behind proxies/VPNs");
-    None
+///
+/// Parsed once per process: the bundle is ~200KB, and `ClientBuilder::cert_store`
+/// accepts `Option<&'static CertStore>` (borrowed, no clone or re-parse).
+fn system_cert_store() -> Option<&'static rquest::tls::CertStore> {
+    static STORE: OnceLock<Option<rquest::tls::CertStore>> = OnceLock::new();
+
+    STORE
+        .get_or_init(|| {
+            const CA_PATHS: &[&str] = &[
+                "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+                "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/Fedora
+                "/etc/ssl/cert.pem",                  // macOS / Alpine
+            ];
+            for path in CA_PATHS {
+                if let Ok(store) = rquest::tls::CertStore::from_pem_file(path) {
+                    eprintln!("[di_auth] loaded system CA bundle from {path}");
+                    return Some(store);
+                }
+            }
+            eprintln!("[di_auth] warning: no system CA bundle found; TLS verification may fail behind proxies/VPNs");
+            None
+        })
+        .as_ref()
 }
 
 /// Build an `rquest::Client` impersonating Chrome 131 on Android with a
 /// persistent cookie store, so cookies (including Cloudflare's `__cflb`)
 /// are shared across the whole SSO + DI token-exchange flow.
 pub fn build_impersonated_client() -> Result<rquest::Client> {
-    let mut builder = rquest::Client::builder()
+    rquest::Client::builder()
         .emulation(
             EmulationOption::builder()
                 .emulation(Emulation::Chrome131)
@@ -135,20 +152,20 @@ pub fn build_impersonated_client() -> Result<rquest::Client> {
                 .build(),
         )
         .cookie_store(true)
+        // Must follow `.emulation()`; see USER_AGENT.
         .user_agent(USER_AGENT)
+        // rquest's builder default is `Policy::none()` despite what its own doc
+        // comment says, and the SSO credential POST 302s to the MFA page.
         .redirect(rquest::redirect::Policy::limited(10))
-        .pool_idle_timeout(Some(std::time::Duration::from_secs(5)))
-        .pool_max_idle_per_host(0)
-        .timeout(HTTP_TIMEOUT);
-
-    if let Some(store) = system_cert_store() {
-        builder = builder.cert_store(store);
-    }
-
-    let client = builder
+        // Expire idle connections quickly — Garmin/Cloudflare drop sockets left
+        // idle across an MFA pause, and reusing a dead one hangs. This replaces
+        // `pool_max_idle_per_host(0)`, which disabled pooling outright and made
+        // every one of the 77 tools' requests pay a fresh TLS handshake.
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .timeout(HTTP_TIMEOUT)
+        .cert_store(system_cert_store())
         .build()
-        .context("failed to build rquest impersonated client")?;
-    Ok(client)
+        .context("failed to build rquest impersonated client")
 }
 
 /// The DI token endpoint is a standard OAuth2 endpoint on `diauth.garmin.com`.
@@ -167,13 +184,11 @@ fn plain_di_client() -> Result<rquest::Client> {
         return Ok(client.clone());
     }
 
-    let mut builder = rquest::Client::builder()
+    let client = rquest::Client::builder()
         .cookie_store(true)
-        .timeout(HTTP_TIMEOUT);
-    if let Some(store) = system_cert_store() {
-        builder = builder.cert_store(store);
-    }
-    let client = builder
+        .timeout(HTTP_TIMEOUT)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .cert_store(system_cert_store())
         .build()
         .context("failed to build plain rquest client for the DI token endpoint")?;
 
@@ -204,32 +219,57 @@ fn signin_url() -> String {
     format!("https://{SSO_HOST}/sso/signin?{}", qs.join("&"))
 }
 
+static TITLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("valid title regex"));
+
+/// `_csrf` inside a single input tag, in either attribute order.
+///
+/// Deliberately looser than it looks like it could be: the token is not
+/// restricted to `\w` (Garmin has emitted base64- and UUID-shaped values, which
+/// contain `-`, `_`, `=` and `.`), attributes may be quoted with either quote
+/// character, and `value` does not have to be the attribute right after `name`.
+/// A pattern that assumes otherwise does not truncate — it fails to match at
+/// all, and the whole login aborts on a perfectly valid page.
+static CSRF_RES: LazyLock<[Regex; 2]> = LazyLock::new(|| {
+    [
+        Regex::new(r#"(?is)name=["']_csrf["'][^>]*?value=["']([^"']+)["']"#)
+            .expect("valid csrf regex"),
+        Regex::new(r#"(?is)value=["']([^"']+)["'][^>]*?name=["']_csrf["']"#)
+            .expect("valid csrf regex"),
+    ]
+});
+
+/// The service ticket in a `response_url` JS variable: `...?ticket=ST-...`.
+///
+/// The terminator set has to include the single quote, whitespace, `<` and `\`
+/// as well as `"` and `&` — a ticket inside a single-quoted JS string would
+/// otherwise be captured together with everything up to the next double quote,
+/// and the exchange would fail three times over with a misleading error.
+static TICKET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[?&]ticket=([^"'&\s<\\]+)"#).expect("valid ticket regex"));
+
 /// Extract the first `<title>...</title>` value from an HTML document.
 fn extract_title(html: &str) -> Option<String> {
-    let re = Regex::new(r"(?is)<title[^>]*>(.*?)</title>").ok()?;
-    re.captures(html)
+    TITLE_RE
+        .captures(html)
         .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
 }
 
 /// Extract the CSRF token (`_csrf`) from a sign-in HTML page.
 fn extract_csrf(html: &str) -> Result<String> {
-    let re = Regex::new(r#"name="_csrf"\s+value="(\w+)""#).context("invalid csrf regex")?;
-    let cap = re
-        .captures(html)
+    CSRF_RES
+        .iter()
+        .find_map(|re| re.captures(html))
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
-        .context("could not find _csrf token in sign-in page")?;
-    Ok(cap)
+        .context("could not find _csrf token in sign-in page")
 }
 
-/// Extract the service ticket from an embed/success page. The ticket appears
-/// in a `response_url` JavaScript variable as `...?ticket=ST-...`.
+/// Extract the service ticket from an embed/success page.
 fn extract_ticket(html: &str) -> Result<String> {
-    let re = Regex::new(r#"[?&]ticket=([^"&]+)"#).context("invalid ticket regex")?;
-    let cap = re
+    TICKET_RE
         .captures(html)
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
-        .context("could not find service ticket in embed page")?;
-    Ok(cap)
+        .context("could not find service ticket in embed page")
 }
 
 /// GET the embed page that seeds the SSO cookies before the sign-in flow.
@@ -275,7 +315,17 @@ pub async fn sso_login(
         .text()
         .await
         .with_context(|| format!("signin page body read {url} failed"))?;
-    let csrf = extract_csrf(&signin_html)?;
+    // These traces are the diagnosis path when Garmin changes its markup: the
+    // regexes below are the first thing to break, and a body length plus a page
+    // title distinguishes "markup moved" from "Cloudflare blocked us".
+    eprintln!(
+        "[di_auth] signin page: {} bytes, title={:?}",
+        signin_html.len(),
+        extract_title(&signin_html).unwrap_or_default()
+    );
+    let csrf = extract_csrf(&signin_html).inspect_err(|_| {
+        eprintln!("[di_auth] signin page preview: {}", preview(&signin_html));
+    })?;
 
     // 3. POST credentials to the sign-in endpoint.
     let form = [
@@ -297,10 +347,20 @@ pub async fn sso_login(
         .with_context(|| format!("signin POST body read {url} failed"))?;
 
     let title = extract_title(&body).unwrap_or_default();
+    eprintln!(
+        "[di_auth] signin POST -> {post_url} ({} bytes, title={title:?})",
+        body.len()
+    );
 
     // 4. MFA required?
     if title.contains("MFA") {
         let csrf = extract_csrf(&body).ok();
+        if csrf.is_none() {
+            eprintln!(
+                "[di_auth] warning: MFA page carried no _csrf token; preview: {}",
+                preview(&body)
+            );
+        }
         return Ok(SsoLoginResult {
             needs_mfa: true,
             ticket: None,
@@ -311,6 +371,7 @@ pub async fn sso_login(
 
     // 5. Hard error on anything other than Success.
     if title != "Success" {
+        eprintln!("[di_auth] signin body preview: {}", preview(&body));
         bail!("Garmin SSO login failed (page title: {title:?})");
     }
 
@@ -318,7 +379,13 @@ pub async fn sso_login(
     let embed_html = portal_embed_body(client).await?;
 
     // 7. Parse the service ticket.
-    let ticket = extract_ticket(&embed_html)?;
+    let ticket = extract_ticket(&embed_html).inspect_err(|_| {
+        eprintln!(
+            "[di_auth] portal embed page: {} bytes; preview: {}",
+            embed_html.len(),
+            preview(&embed_html)
+        );
+    })?;
     Ok(SsoLoginResult {
         needs_mfa: false,
         ticket: Some(ticket),
@@ -518,62 +585,127 @@ fn parse_di_session(text: &str, client_id: &str, prev: Option<&DiSession>) -> Re
     })
 }
 
-fn preview(text: &str) -> String {
+pub(crate) fn preview(text: &str) -> String {
     text.chars().take(200).collect()
 }
 
-/// Persist a session to `.di_session.json`.
+/// Where the DI session cache lives.
+///
+/// `SESSION_FILE` is CWD-relative, and a stdio MCP server launched by a desktop
+/// client inherits whatever CWD that client had — often `/`. `GARMIN_SESSION_FILE`
+/// pins it to an absolute path.
+fn session_path() -> PathBuf {
+    non_empty_env("GARMIN_SESSION_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(SESSION_FILE))
+}
+
+/// Persist a session, readable only by its owner.
+///
+/// The file holds a ~30 day refresh token; `fs::write` would create it 0644
+/// under a typical umask, i.e. readable by every local account.
 pub fn save_session(session: &DiSession) -> Result<()> {
+    let path = session_path();
     let json = serde_json::to_string_pretty(session).context("failed to serialize session")?;
-    std::fs::write(SESSION_FILE, json).with_context(|| format!("failed to write {SESSION_FILE}"))?;
-    Ok(())
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut file = opts
+        .open(&path)
+        .with_context(|| format!("failed to open {} for writing", path.display()))?;
+
+    // `mode()` only applies to a file this call creates, so tighten an existing
+    // one (e.g. written by a version before this).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+
+    std::io::Write::write_all(&mut file, json.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Persist a session, downgrading a failure to a warning.
+///
+/// A read-only CWD must not throw away a session that was just obtained at the
+/// cost of a full SSO + MFA round trip — it only means the next start logs in
+/// again.
+pub fn persist_session(session: &DiSession) {
+    if let Err(e) = save_session(session) {
+        eprintln!("[di_auth] warning: could not persist session ({e:#}); the next start will log in again");
+    }
 }
 
 /// Load a previously persisted session.
 pub fn load_session() -> Result<DiSession> {
-    let text =
-        std::fs::read_to_string(SESSION_FILE).with_context(|| format!("failed to read {SESSION_FILE}"))?;
-    let session: DiSession =
-        serde_json::from_str(&text).with_context(|| format!("failed to parse {SESSION_FILE}"))?;
-    Ok(session)
+    let path = session_path();
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// An env var's trimmed value, or `None` when it is unset *or* set to an empty
+/// string.
+///
+/// `FOO=` is a placeholder, not an answer — a `.env` full of empty keys must
+/// fall through to the `_FILE` and stdin fallbacks instead of submitting empty
+/// credentials and blaming Garmin for the rejection.
+pub(crate) fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|val| val.trim().to_string())
+        .filter(|val| !val.is_empty())
 }
 
 /// Read a secret from an env var, falling back to a `_FILE` env var whose
 /// value is a path to a file containing the secret.
 pub fn read_secret(env_key: &str, file_key: &str) -> Result<String> {
-    if let Ok(val) = std::env::var(env_key) {
-        return Ok(val.trim().to_string());
+    if let Some(val) = non_empty_env(env_key) {
+        return Ok(val);
     }
-    if let Ok(path) = std::env::var(file_key) {
+    if let Some(path) = non_empty_env(file_key) {
         let content = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("could not read {path}: {e}"))?;
-        return Ok(content.trim().to_string());
+        let content = content.trim();
+        if content.is_empty() {
+            bail!("{file_key} points at {path}, which is empty");
+        }
+        return Ok(content.to_string());
     }
     bail!("{env_key} or {file_key} environment variable is required")
 }
 
 /// Read the MFA code from `GARMIN_MFA_CODE` env, a file pointed to by
 /// `GARMIN_MFA_CODE_FILE` (polled for non-interactive/agent runs), or stdin.
+/// Blocking: poll/prompt for up to `MFA_WAIT`. Call it from `spawn_blocking`.
 pub fn read_mfa_code() -> Result<String> {
-    if let Ok(val) = std::env::var("GARMIN_MFA_CODE") {
-        return Ok(val.trim().to_string());
+    if let Some(val) = non_empty_env("GARMIN_MFA_CODE") {
+        return Ok(val);
     }
 
     // File-based fallback with polling: lets an external agent inject the
     // MFA code into a running test by writing it to a file (stdin is not
     // reachable when the test is spawned in the background).
-    if let Ok(path) = std::env::var("GARMIN_MFA_CODE_FILE") {
+    if let Some(path) = non_empty_env("GARMIN_MFA_CODE_FILE") {
         eprintln!("[di_auth] waiting for MFA code in file: {path}");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let deadline = std::time::Instant::now() + MFA_WAIT;
         while std::time::Instant::now() < deadline {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let code = content.trim();
                 if !code.is_empty() {
-                    let _ = std::fs::remove_file(&path);
+                    // Deleted only once the code has actually been accepted;
+                    // see clear_mfa_code_file.
                     return Ok(code.to_string());
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(500));
         }
         bail!("timed out waiting for MFA code in {path}");
     }
@@ -584,6 +716,17 @@ pub fn read_mfa_code() -> Result<String> {
         .read_line(&mut input)
         .context("failed to read MFA code from stdin")?;
     Ok(input.trim().to_string())
+}
+
+/// Remove the injected MFA code file once the code has been accepted.
+///
+/// Deleting it at read time throws away a still-valid code whenever the POST
+/// fails, leaving no way to retry — and destroys whatever file the user pointed
+/// the variable at, even a persistent one.
+fn clear_mfa_code_file() {
+    if let Some(path) = non_empty_env("GARMIN_MFA_CODE_FILE") {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// The account a cached session must belong to: `GARMIN_EMAIL` (or its `_FILE`
@@ -629,7 +772,11 @@ fn session_matches_account(session: &DiSession, want: Option<&str>) -> bool {
 ///   1. Cached session with a valid refresh token (refresh if expired).
 ///   2. `GARMIN_SERVICE_TICKET` env var → exchange for a session.
 ///   3. `GARMIN_EMAIL` + `GARMIN_PASSWORD` (→ MFA if needed) → exchange.
-pub async fn authenticate() -> Result<DiSession> {
+///
+/// `client` is the process-wide impersonated client, passed in so that the SSO
+/// cookies earned here (Cloudflare's `__cflb` in particular) are the same ones
+/// the API layer later sends.
+pub async fn authenticate(client: &rquest::Client) -> Result<DiSession> {
     let want_account = configured_account();
 
     // Layer 1: cached session, but only if it belongs to the configured account.
@@ -643,11 +790,13 @@ pub async fn authenticate() -> Result<DiSession> {
                 eprintln!("[di_auth] cached access token expired; refreshing...");
                 match refresh_di_token(&session).await {
                     Ok(new_session) => {
-                        let _ = save_session(&new_session);
+                        persist_session(&new_session);
                         return Ok(new_session);
                     }
                     Err(e) => {
-                        eprintln!("[di_auth] refresh failed ({e}); falling through to fresh login");
+                        eprintln!(
+                            "[di_auth] refresh failed ({e:#}); falling through to fresh login"
+                        );
                     }
                 }
             } else {
@@ -658,22 +807,19 @@ pub async fn authenticate() -> Result<DiSession> {
     }
 
     // Layer 2: service ticket from env.
-    if let Ok(ticket) = std::env::var("GARMIN_SERVICE_TICKET") {
-        let ticket = ticket.trim();
-        if !ticket.is_empty() {
-            eprintln!("[di_auth] exchanging GARMIN_SERVICE_TICKET for DI session...");
-            match exchange_service_ticket(ticket).await {
-                Ok(mut session) => {
-                    session.account = want_account.clone();
-                    save_session(&session)?;
-                    return Ok(session);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[di_auth] service ticket exchange failed ({e:#}); \
-                         falling through to email/password login"
-                    );
-                }
+    if let Some(ticket) = non_empty_env("GARMIN_SERVICE_TICKET") {
+        eprintln!("[di_auth] exchanging GARMIN_SERVICE_TICKET for DI session...");
+        match exchange_service_ticket(&ticket).await {
+            Ok(mut session) => {
+                session.account = want_account.clone();
+                persist_session(&session);
+                return Ok(session);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[di_auth] service ticket exchange failed ({e:#}); \
+                     falling through to email/password login"
+                );
             }
         }
     }
@@ -683,19 +829,25 @@ pub async fn authenticate() -> Result<DiSession> {
     let password = read_secret("GARMIN_PASSWORD", "GARMIN_PASSWORD_FILE")?;
 
     eprintln!("[di_auth] authenticating with Garmin SSO ({SSO_HOST})...");
-    let client = build_impersonated_client()?;
-    let result = sso_login(&client, &email, &password).await?;
+    let result = sso_login(client, &email, &password).await?;
 
     let ticket = if result.needs_mfa {
         eprintln!("[di_auth] MFA required.");
-        let code = read_mfa_code()?;
+        // `read_mfa_code` blocks for up to five minutes (file polling) or
+        // indefinitely (stdin). On the current-thread runtime the integration
+        // test uses, doing that inline freezes the whole runtime.
+        let code = tokio::task::spawn_blocking(read_mfa_code)
+            .await
+            .context("MFA code reader task panicked")??;
         let csrf = result
             .mfa_csrf
             .context("MFA required but no CSRF token was extracted from the MFA page")?;
         let mfa_url = result
             .mfa_url
             .context("MFA required but no MFA page URL was captured")?;
-        submit_mfa(&client, &code, &csrf, &mfa_url).await?
+        let ticket = submit_mfa(client, &code, &csrf, &mfa_url).await?;
+        clear_mfa_code_file();
+        ticket
     } else {
         result
             .ticket
@@ -705,6 +857,6 @@ pub async fn authenticate() -> Result<DiSession> {
     eprintln!("[di_auth] exchanging service ticket for DI session...");
     let mut session = exchange_service_ticket(&ticket).await?;
     session.account = Some(email.trim().to_lowercase());
-    save_session(&session)?;
+    persist_session(&session);
     Ok(session)
 }

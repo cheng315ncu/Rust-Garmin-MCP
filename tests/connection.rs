@@ -16,7 +16,7 @@ async fn connects_and_authenticates_with_garmin() {
 
     if let Err(e) = create_garmin_server().await {
         panic!(
-            "Garmin connection test failed: {e}\n\
+            "Garmin connection test failed: {e:#}\n\
              Authentication options:\n\
              1. Cached DI session (.di_session.json with valid refresh token)\n\
              2. GARMIN_SERVICE_TICKET=<ticket> env var\n\

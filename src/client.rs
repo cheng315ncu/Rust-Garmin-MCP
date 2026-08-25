@@ -13,9 +13,29 @@ use moka::future::Cache;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::di_auth::{self, DiSession};
+use crate::di_auth::{self, preview, DiSession};
 
-pub const API_BASE: &str = "https://connectapi.garmin.com";
+const API_BASE: &str = "https://connectapi.garmin.com";
+/// Garmin's mobile app version, sent on every connectapi request.
+const APP_VER: &str = "4.70.2.0";
+
+/// Absolute URL for a connectapi endpoint, with or without a leading slash
+/// (`connectapi.garmin.com//path` 404s).
+pub(crate) fn api_url(endpoint: &str) -> String {
+    format!("{}/{}", API_BASE, endpoint.trim_start_matches('/'))
+}
+
+/// The header set every authenticated connectapi request needs. Defined once so
+/// that bumping `X-app-ver` is a one-line change rather than a grep.
+pub(crate) fn garmin_headers(
+    req: rquest::RequestBuilder,
+    access_token: &str,
+) -> rquest::RequestBuilder {
+    req.header("Authorization", format!("Bearer {access_token}"))
+        .header("NK", "NT")
+        .header("X-app-ver", APP_VER)
+        .header("Accept", "application/json")
+}
 
 /// Max cached GET responses (LRU-evicted past this).
 const CACHE_MAX_ENTRIES: u64 = 1_000;
@@ -82,7 +102,10 @@ pub struct GarminApiClient {
 }
 
 impl GarminApiClient {
-    pub fn new(session: DiSession, display_name: String) -> Self {
+    /// `http` is the process-wide impersonated client built in `auth.rs`, so
+    /// the API layer reuses the cookie jar and connection pool that the SSO
+    /// login warmed up.
+    pub fn new(http: rquest::Client, session: DiSession, display_name: String) -> Self {
         let cache = Cache::builder()
             .max_capacity(CACHE_MAX_ENTRIES)
             .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
@@ -93,8 +116,7 @@ impl GarminApiClient {
         )));
 
         Self {
-            http: di_auth::build_impersonated_client()
-                .expect("rquest impersonated client build failed"),
+            http,
             token: Arc::new(RwLock::new(session)),
             display_name,
             cache,
@@ -131,16 +153,11 @@ impl GarminApiClient {
             ensure_token_fresh(token.clone(), refresh).await;
 
             let guard = token.read().await;
-            let auth_header = format!("Bearer {}", guard.access_token);
+            let access_token = guard.access_token.clone();
             drop(guard); // release read lock before the network call
 
-            let url = format!("{}/{}", API_BASE, endpoint_owned);
-            let mut req = http
-                .get(&url)
-                .header("Authorization", auth_header)
-                .header("NK", "NT")
-                .header("X-app-ver", "4.70.2.0")
-                .header("Accept", "application/json");
+            let url = api_url(&endpoint_owned);
+            let mut req = garmin_headers(http.get(&url), &access_token);
 
             if let Some(p) = params_owned.as_ref() {
                 req = req.query(&p);
@@ -191,7 +208,9 @@ impl GarminApiClient {
         match self.cache.try_get_with(key, init).await {
             Ok(arc) => Ok((*arc).clone()),
             // moka wraps init errors in Arc<E> so concurrent waiters share one.
-            Err(arc_err) => Err(anyhow::anyhow!("{}", arc_err)),
+            // `{:#}` so the `.with_context` chain above survives; plain `{}`
+            // prints only the outermost frame and deletes the real cause.
+            Err(arc_err) => Err(anyhow::anyhow!("{arc_err:#}")),
         }
     }
 
@@ -220,32 +239,34 @@ impl GarminApiClient {
         self.refresh_token_if_needed().await;
 
         let token = self.token.read().await;
-        let auth_header = format!("Bearer {}", token.access_token);
+        let access_token = token.access_token.clone();
         drop(token); // release read lock before the network call
 
         let endpoint = endpoint.trim_start_matches('/');
-        let url = format!("{}/{}", API_BASE, endpoint);
+        let url = api_url(endpoint);
 
-        let mut req = match method {
+        let req = match method {
             "POST" => self.http.post(&url),
             "PUT" => self.http.put(&url),
             "DELETE" => self.http.delete(&url),
             _ => anyhow::bail!("unsupported HTTP method: {}", method),
         };
 
-        req = req
-            .header("Authorization", auth_header)
-            .header("NK", "NT")
-            .header("X-app-ver", "4.70.2.0")
-            .header("Accept", "application/json");
+        let mut req = garmin_headers(req, &access_token);
 
         if let Some(b) = body {
             req = req.json(&b);
         }
 
-        let resp = req.send().await?;
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("Garmin API {method} {url} failed"))?;
         let status = resp.status();
-        let text = resp.text().await?;
+        let text = resp
+            .text()
+            .await
+            .with_context(|| format!("Garmin API {method} {url} body read failed"))?;
 
         if !status.is_success() {
             anyhow::bail!(
@@ -338,7 +359,7 @@ async fn ensure_token_fresh(token: Arc<RwLock<DiSession>>, refresh: Arc<Mutex<Re
                 new_session.expires_at
             );
             if let Err(e) = di_auth::save_session(&new_session) {
-                eprintln!("[client] warning: could not persist refreshed session: {e}");
+                eprintln!("[client] warning: could not persist refreshed session: {e:#}");
             }
             *token.write().await = new_session;
             state.next_attempt = None;
@@ -350,7 +371,7 @@ async fn ensure_token_fresh(token: Arc<RwLock<DiSession>>, refresh: Arc<Mutex<Re
             let backoff = refresh_backoff(state.failures);
             state.next_attempt = Some(Instant::now() + backoff);
             eprintln!(
-                "[client] warning: DI token refresh failed ({e}); next attempt in {}s",
+                "[client] warning: DI token refresh failed ({e:#}); next attempt in {}s",
                 backoff.as_secs()
             );
         }
@@ -366,10 +387,6 @@ fn refresh_backoff(failures: u32) -> Duration {
         .min(REFRESH_BACKOFF_MAX)
 }
 
-fn preview(text: &str) -> String {
-    text.chars().take(200).collect()
-}
-
 /// Build a stable cache key from `endpoint` + sorted params.
 fn build_cache_key(endpoint: &str, params: Option<&HashMap<String, String>>) -> String {
     let ep = endpoint.trim_start_matches('/');
@@ -380,7 +397,10 @@ fn build_cache_key(endpoint: &str, params: Option<&HashMap<String, String>>) -> 
             let mut entries: Vec<(&str, &str)> =
                 p.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             entries.sort_by_key(|(k, _)| *k);
-            let qs: Vec<String> = entries.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            let qs: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
             format!("{}?{}", ep, qs.join("&"))
         }
     }

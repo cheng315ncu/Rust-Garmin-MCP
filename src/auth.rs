@@ -1,15 +1,21 @@
 use anyhow::Result;
 
-use crate::client::GarminApiClient;
+use crate::client::{self, GarminApiClient};
 use crate::di_auth;
 use crate::tools::GarminMcpServer;
 
 pub async fn create_garmin_server() -> Result<GarminMcpServer> {
     let _ = dotenvy::dotenv();
 
-    let session = di_auth::authenticate().await?;
+    // One impersonated client for the whole process. The SSO login, the
+    // display-name probe and every API call then share its cookie jar — the
+    // Cloudflare `__cflb` cookie earned during login has to reach connectapi —
+    // and its connection pool.
+    let http = di_auth::build_impersonated_client()?;
 
-    let display_name = resolve_display_name(&session.access_token).await;
+    let session = di_auth::authenticate(&http).await?;
+
+    let display_name = resolve_display_name(&http, &session.access_token).await;
     if display_name.is_empty() {
         eprintln!("Warning: display name is empty.");
         eprintln!("  Set GARMIN_DISPLAY_NAME=<handle> in .env to override.");
@@ -17,18 +23,15 @@ pub async fn create_garmin_server() -> Result<GarminMcpServer> {
         eprintln!("Logged in as: {display_name}");
     }
 
-    let api = GarminApiClient::new(session, display_name);
+    let api = GarminApiClient::new(http, session, display_name);
     Ok(GarminMcpServer::new(api))
 }
 
 /// Try env var override first, then probe multiple Garmin API endpoints with
 /// the DI access token as a Bearer credential.
-async fn resolve_display_name(access_token: &str) -> String {
-    if let Ok(name) = std::env::var("GARMIN_DISPLAY_NAME") {
-        let name = name.trim().to_string();
-        if !name.is_empty() {
-            return name;
-        }
+async fn resolve_display_name(client: &rquest::Client, access_token: &str) -> String {
+    if let Some(name) = di_auth::non_empty_env("GARMIN_DISPLAY_NAME") {
+        return name;
     }
 
     let endpoints = [
@@ -37,13 +40,8 @@ async fn resolve_display_name(access_token: &str) -> String {
         "/userprofile-service/userprofile",
     ];
 
-    let client = di_auth::build_impersonated_client().unwrap_or_else(|e| {
-        eprintln!("[auth] warning: could not build probe client ({e})");
-        rquest::Client::new()
-    });
-
     for endpoint in &endpoints {
-        if let Some(name) = try_display_name(&client, endpoint, access_token).await {
+        if let Some(name) = try_display_name(client, endpoint, access_token).await {
             return name;
         }
     }
@@ -56,15 +54,9 @@ async fn try_display_name(
     endpoint: &str,
     access_token: &str,
 ) -> Option<String> {
-    let endpoint = endpoint.trim_start_matches('/');
-    let url = format!("{}/{}", crate::client::API_BASE, endpoint);
+    let url = client::api_url(endpoint);
 
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("NK", "NT")
-        .header("X-app-ver", "4.70.2.0")
-        .header("Accept", "application/json")
+    let resp = client::garmin_headers(client.get(&url), access_token)
         .send()
         .await
         .ok()?;
@@ -72,7 +64,10 @@ async fn try_display_name(
     let status = resp.status();
     let text = resp.text().await.ok()?;
 
-    eprintln!("[auth] {endpoint} -> status={status}, body_len={}", text.len());
+    eprintln!(
+        "[auth] {endpoint} -> status={status}, body_len={}",
+        text.len()
+    );
 
     if text.is_empty() {
         return None;
