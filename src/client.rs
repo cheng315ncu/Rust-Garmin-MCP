@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use governor::{
@@ -11,7 +11,7 @@ use governor::{
 };
 use moka::future::Cache;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::di_auth::{self, DiSession};
 
@@ -25,8 +25,31 @@ const CACHE_TTL_SECS: u64 = 60;
 /// Per-minute request budget against Garmin Connect. 60 req/min is a
 /// conservative starting point. Adjust if tools begin failing with 429.
 const RATE_LIMIT_PER_MIN: u32 = 60;
+/// First backoff step after a failed DI token refresh.
+const REFRESH_BACKOFF_MIN: Duration = Duration::from_secs(30);
+/// Ceiling for the exponential backoff between failed refresh attempts, so a
+/// long-lived server keeps checking occasionally instead of giving up.
+const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(900);
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+/// Coordination state for DI access-token refresh.
+///
+/// Deliberately a separate lock from `RwLock<DiSession>`: it serialises the
+/// refresh (so concurrent callers make one network call, not N) *without*
+/// anyone holding the session lock across an await.  Holding the session write
+/// guard over the refresh means one stalled `diauth.garmin.com` connection
+/// blocks every request in the process, with no log line and no recovery.
+#[derive(Default)]
+struct RefreshState {
+    /// Earliest instant at which another refresh may be attempted.
+    next_attempt: Option<Instant>,
+    /// Consecutive failures; drives the exponential backoff.
+    failures: u32,
+    /// Set once the refresh token itself is dead, so that warning is printed
+    /// once rather than on every single request.
+    reported_dead: bool,
+}
 
 /// Shared Garmin API session.
 ///
@@ -54,6 +77,8 @@ pub struct GarminApiClient {
     cache: Cache<String, Arc<Value>>,
     /// Shared across api_json and api_write — one budget for all traffic.
     limiter: Arc<Limiter>,
+    /// Serialises token refresh and remembers failures; see `RefreshState`.
+    refresh: Arc<Mutex<RefreshState>>,
 }
 
 impl GarminApiClient {
@@ -74,6 +99,7 @@ impl GarminApiClient {
             display_name,
             cache,
             limiter,
+            refresh: Arc::new(Mutex::new(RefreshState::default())),
         }
     }
 
@@ -93,6 +119,7 @@ impl GarminApiClient {
         let http = self.http.clone();
         let token = self.token.clone();
         let limiter = self.limiter.clone();
+        let refresh = self.refresh.clone();
         let endpoint_owned = endpoint.trim_start_matches('/').to_string();
         let params_owned = params;
 
@@ -101,7 +128,7 @@ impl GarminApiClient {
             limiter.until_ready().await;
 
             // Refresh the DI access token if it is about to expire.
-            ensure_token_fresh(token.clone()).await;
+            ensure_token_fresh(token.clone(), refresh).await;
 
             let guard = token.read().await;
             let auth_header = format!("Bearer {}", guard.access_token);
@@ -250,7 +277,7 @@ impl GarminApiClient {
     /// Refresh the DI access token when it is about to expire, using the
     /// refresh token, and persist the new session.
     async fn refresh_token_if_needed(&self) {
-        ensure_token_fresh(self.token.clone()).await;
+        ensure_token_fresh(self.token.clone(), self.refresh.clone()).await;
     }
 
     pub fn require_display_name(&self) -> std::result::Result<&str, String> {
@@ -263,46 +290,80 @@ impl GarminApiClient {
 }
 
 /// Free-function twin of `refresh_token_if_needed` usable from the 'static
-/// moka init future (which cannot borrow `&self`).  Double-checked locking:
-/// fast path takes a read lock, slow path upgrades to a write lock and
-/// re-checks so only one task performs the refresh.
-async fn ensure_token_fresh(token: Arc<RwLock<DiSession>>) {
-    // Fast path: read lock — token is still valid.
-    {
+/// moka init future (which cannot borrow `&self`).
+///
+/// The session `RwLock` is never held across the refresh network call.  The
+/// `refresh` mutex is what serialises concurrent callers, so exactly one
+/// refresh goes out; the session lock is taken only for the (non-await)
+/// expiry checks and the final store.
+async fn ensure_token_fresh(token: Arc<RwLock<DiSession>>, refresh: Arc<Mutex<RefreshState>>) {
+    // Fast path: token is still valid, no coordination needed.
+    if !token.read().await.is_expired() {
+        return;
+    }
+
+    // Slow path: one refresher at a time; everyone else waits here and then
+    // re-checks, because the holder may have just refreshed the token.
+    let mut state = refresh.lock().await;
+
+    let session = {
         let guard = token.read().await;
         if !guard.is_expired() {
             return;
         }
-    }
+        if !guard.refresh_is_valid() {
+            // No amount of retrying fixes a dead refresh token, so say it once.
+            if !state.reported_dead {
+                state.reported_dead = true;
+                eprintln!(
+                    "[client] warning: access token expired and the refresh token is no longer valid; restart to re-login"
+                );
+            }
+            return;
+        }
+        guard.clone()
+    };
 
-    // Slow path: upgrade to write lock (only one task proceeds).
-    let mut guard = token.write().await;
-
-    // Re-check under write lock.
-    if !guard.is_expired() {
+    // Back off after a failure instead of re-running the whole refresh (new
+    // client, CA bundle parse, POST) on every single request.
+    if state.next_attempt.is_some_and(|next| Instant::now() < next) {
         return;
     }
 
-    if !guard.refresh_is_valid() {
-        eprintln!(
-            "[client] warning: access token expired and refresh token no longer valid; re-login needed"
-        );
-        return;
-    }
-
-    match di_auth::refresh_di_token(&guard).await {
+    // Note the absence of any lock guard across this await.
+    match di_auth::refresh_di_token(&session).await {
         Ok(new_session) => {
             eprintln!(
                 "[client] DI access token refreshed (expires_at={})",
                 new_session.expires_at
             );
-            let _ = di_auth::save_session(&new_session);
-            *guard = new_session;
+            if let Err(e) = di_auth::save_session(&new_session) {
+                eprintln!("[client] warning: could not persist refreshed session: {e}");
+            }
+            *token.write().await = new_session;
+            state.next_attempt = None;
+            state.failures = 0;
+            state.reported_dead = false;
         }
         Err(e) => {
-            eprintln!("[client] warning: DI token refresh failed: {e}");
+            state.failures = state.failures.saturating_add(1);
+            let backoff = refresh_backoff(state.failures);
+            state.next_attempt = Some(Instant::now() + backoff);
+            eprintln!(
+                "[client] warning: DI token refresh failed ({e}); next attempt in {}s",
+                backoff.as_secs()
+            );
         }
     }
+}
+
+/// Exponential backoff between failed refresh attempts: doubles per
+/// consecutive failure, capped at `REFRESH_BACKOFF_MAX`.
+fn refresh_backoff(failures: u32) -> Duration {
+    let steps = failures.saturating_sub(1).min(5);
+    REFRESH_BACKOFF_MIN
+        .saturating_mul(1 << steps)
+        .min(REFRESH_BACKOFF_MAX)
 }
 
 fn preview(text: &str) -> String {

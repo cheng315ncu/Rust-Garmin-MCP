@@ -3,7 +3,8 @@
 //! Replaces the deprecated `garmin_client` (garth-based) SSO flow that broke
 //! when Garmin enabled Cloudflare TLS fingerprinting in March 2026.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -27,9 +28,31 @@ const DI_CLIENT_IDS: &[&str] = &[
     "GARMIN_CONNECT_MOBILE_ANDROID_DI",
 ];
 
-/// Mobile UA for the SSO HTML flow (kept as explicit override; the rquest
-/// Chrome emulation also sets a matching UA for TLS-fingerprint consistency).
-const USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+/// User-Agent for every impersonated request.  It must agree with the TLS /
+/// HTTP2 fingerprint of `Emulation::Chrome131` + `EmulationOS::Android` and
+/// with the `sec-ch-ua*` client hints that emulation installs, or the three
+/// together are a stronger bot signal than no emulation at all.
+///
+/// We override the emulation's own UA because rquest-util 2.2.1 ships a
+/// malformed literal for this arm — `Mozilla/5.0 (Linux: Android 10; K) …
+/// Chrome/131.0.0.0 Safari/537.36`, with a colon after `Linux` and no `Mobile`
+/// token (see `rquest-util/src/emulation/device/chrome.rs`, the `v131` Android
+/// tuple).  The string below is what real Chrome 131 on Android sends.
+///
+/// Order matters: `.user_agent()` must stay AFTER `.emulation()`.  `emulation()`
+/// `mem::swap`s the whole header map, so a UA set before it is discarded.
+const USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+
+/// Request timeout for every Garmin HTTP call.  rquest's builder default is
+/// `timeout: None`; an unbounded DI refresh is what wedges the client layer.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fallback access-token lifetime when the DI response omits `expires_in`.
+const DEFAULT_ACCESS_TTL_SECS: u64 = 3_600;
+
+/// Fallback refresh-token lifetime (~30 days), used only when the DI response
+/// omits `refresh_expires_in` and there is no previous value to carry forward.
+const DEFAULT_REFRESH_TTL_SECS: u64 = 2_592_000;
 
 /// Persisted DI OAuth2 session.
 #[derive(Serialize, Deserialize, Clone)]
@@ -41,6 +64,11 @@ pub struct DiSession {
     /// Epoch seconds at which `refresh_token` expires.
     pub refresh_expires_at: u64,
     pub client_id: String,
+    /// Garmin account this session was minted for, lowercased, so a cached
+    /// session is never reused after `GARMIN_EMAIL` changes.  `None` in
+    /// session files written before this field existed.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 impl DiSession {
@@ -111,7 +139,7 @@ pub fn build_impersonated_client() -> Result<rquest::Client> {
         .redirect(rquest::redirect::Policy::limited(10))
         .pool_idle_timeout(Some(std::time::Duration::from_secs(5)))
         .pool_max_idle_per_host(0)
-        .timeout(std::time::Duration::from_secs(30));
+        .timeout(HTTP_TIMEOUT);
 
     if let Some(store) = system_cert_store() {
         builder = builder.cert_store(store);
@@ -121,6 +149,35 @@ pub fn build_impersonated_client() -> Result<rquest::Client> {
         .build()
         .context("failed to build rquest impersonated client")?;
     Ok(client)
+}
+
+/// The DI token endpoint is a standard OAuth2 endpoint on `diauth.garmin.com`.
+/// It does NOT need TLS fingerprint impersonation (unlike `sso.garmin.com`,
+/// which is behind Cloudflare) — Chrome emulation causes handshake trouble
+/// there.  Do not unify this with `build_impersonated_client`.
+///
+/// One process-wide client: the CA bundle is parsed once and the connection is
+/// reused across the initial exchange and every later refresh.  Crucially it
+/// carries `HTTP_TIMEOUT`, without which a half-open connection to
+/// diauth.garmin.com hangs the refresh forever.
+fn plain_di_client() -> Result<rquest::Client> {
+    static CLIENT: OnceLock<rquest::Client> = OnceLock::new();
+
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+
+    let mut builder = rquest::Client::builder()
+        .cookie_store(true)
+        .timeout(HTTP_TIMEOUT);
+    if let Some(store) = system_cert_store() {
+        builder = builder.cert_store(store);
+    }
+    let client = builder
+        .build()
+        .context("failed to build plain rquest client for the DI token endpoint")?;
+
+    Ok(CLIENT.get_or_init(|| client).clone())
 }
 
 /// Sign-in page query params. Garmin's embed widget expects every redirect
@@ -322,17 +379,7 @@ pub async fn submit_mfa(
 /// Exchange a service ticket for a DI OAuth2 session. Tries each client ID
 /// in turn until one succeeds.
 pub async fn exchange_service_ticket(ticket: &str) -> Result<DiSession> {
-    // The DI token endpoint is a standard OAuth2 endpoint on diauth.garmin.com.
-    // It does NOT need TLS fingerprint impersonation (unlike sso.garmin.com which
-    // is behind Cloudflare).  Using a plain rquest client avoids potential TLS
-    // handshake issues caused by Chrome emulation on this endpoint.
-    let mut builder = rquest::Client::builder().cookie_store(true);
-    if let Some(store) = system_cert_store() {
-        builder = builder.cert_store(store);
-    }
-    let client = builder
-        .build()
-        .context("failed to build plain rquest client for DI exchange")?;
+    let client = plain_di_client()?;
 
     let mut last_err: Option<anyhow::Error> = None;
     for &client_id in DI_CLIENT_IDS {
@@ -380,18 +427,12 @@ async fn try_exchange(
         bail!("DI token exchange failed ({status}): {}", preview(&text));
     }
 
-    parse_di_session(&text, client_id)
+    parse_di_session(&text, client_id, None)
 }
 
 /// Refresh an expired access token using the refresh token.
 pub async fn refresh_di_token(session: &DiSession) -> Result<DiSession> {
-    let mut builder = rquest::Client::builder().cookie_store(true);
-    if let Some(store) = system_cert_store() {
-        builder = builder.cert_store(store);
-    }
-    let client = builder
-        .build()
-        .context("failed to build plain rquest client for DI refresh")?;
+    let client = plain_di_client()?;
     let basic = STANDARD.encode(format!("{}:", session.client_id));
     let form = [
         ("client_id", session.client_id.clone()),
@@ -419,12 +460,18 @@ pub async fn refresh_di_token(session: &DiSession) -> Result<DiSession> {
         bail!("DI token refresh failed ({status}): {}", preview(&text));
     }
 
-    parse_di_session(&text, &session.client_id)
+    parse_di_session(&text, &session.client_id, Some(session))
 }
 
 /// Parse a DI token JSON response into a `DiSession`, computing absolute
 /// expiry timestamps from the relative `expires_in` / `refresh_expires_in`.
-fn parse_di_session(text: &str, client_id: &str) -> Result<DiSession> {
+///
+/// `prev` is the session being refreshed, when there is one.  RFC 6749 §6 makes
+/// `refresh_token` OPTIONAL in a refresh response: a provider with rotation
+/// disabled returns only a new access token, and the existing refresh token
+/// stays valid.  Treating that as an error would break every refresh, so the
+/// previous token and its expiry are carried forward instead.
+fn parse_di_session(text: &str, client_id: &str, prev: Option<&DiSession>) -> Result<DiSession> {
     let v: Value = serde_json::from_str(text)
         .with_context(|| format!("DI token response is not JSON: {}", preview(text)))?;
 
@@ -433,25 +480,41 @@ fn parse_di_session(text: &str, client_id: &str) -> Result<DiSession> {
         .and_then(Value::as_str)
         .context("DI token response missing access_token")?
         .to_string();
-    let refresh_token = v
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .context("DI token response missing refresh_token")?
-        .to_string();
-
-    let expires_in = v.get("expires_in").and_then(Value::as_u64).unwrap_or(3600);
-    let refresh_expires_in = v
-        .get("refresh_expires_in")
-        .and_then(Value::as_u64)
-        .unwrap_or(2_592_000); // ~30 days
 
     let now = now_secs();
+    let refresh_expires_in = v.get("refresh_expires_in").and_then(Value::as_u64);
+
+    let (refresh_token, refresh_expires_at) = match v.get("refresh_token").and_then(Value::as_str) {
+        Some(token) => (
+            token.to_string(),
+            now + refresh_expires_in.unwrap_or(DEFAULT_REFRESH_TTL_SECS),
+        ),
+        None => {
+            // No prior session means this was an initial exchange, where the
+            // refresh token really is mandatory.
+            let prev = prev.context("DI token response missing refresh_token")?;
+            (
+                prev.refresh_token.clone(),
+                // Only move the deadline when the server actually restated it;
+                // otherwise keep the real one rather than optimistically
+                // extending the window by another 30 days.
+                refresh_expires_in.map_or(prev.refresh_expires_at, |ttl| now + ttl),
+            )
+        }
+    };
+
+    let expires_in = v
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_ACCESS_TTL_SECS);
+
     Ok(DiSession {
         access_token,
         refresh_token,
         expires_at: now + expires_in,
-        refresh_expires_at: now + refresh_expires_in,
+        refresh_expires_at,
         client_id: client_id.to_string(),
+        account: prev.and_then(|p| p.account.clone()),
     })
 }
 
@@ -523,15 +586,60 @@ pub fn read_mfa_code() -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+/// The account a cached session must belong to: `GARMIN_EMAIL` (or its `_FILE`
+/// variant), lowercased.  `None` when neither is set — e.g. a
+/// `GARMIN_SERVICE_TICKET`-only deployment, where there is nothing to compare
+/// against.
+fn configured_account() -> Option<String> {
+    read_secret("GARMIN_EMAIL", "GARMIN_EMAIL_FILE")
+        .ok()
+        .map(|email| email.trim().to_lowercase())
+        .filter(|email| !email.is_empty())
+}
+
+/// A cached session may only be reused when it was minted for the account this
+/// process is configured with.  Without this check, editing `GARMIN_EMAIL` and
+/// restarting keeps serving the *previous* account's health data for as long as
+/// its refresh token lives (~30 days), because layer 1 never reads the env at
+/// all.
+///
+/// Sessions written before `account` existed carry `None`; they are rejected
+/// whenever an account IS configured, since we cannot prove they belong to it
+/// and one extra login is cheaper than the wrong person's data.
+fn session_matches_account(session: &DiSession, want: Option<&str>) -> bool {
+    match (session.account.as_deref(), want) {
+        (_, None) => true,
+        (Some(have), Some(want)) if have == want => true,
+        (Some(have), Some(want)) => {
+            eprintln!(
+                "[di_auth] cached session belongs to {have}, but the configured account is {want}; re-authenticating"
+            );
+            false
+        }
+        (None, Some(_)) => {
+            eprintln!(
+                "[di_auth] cached session predates account binding; re-authenticating to confirm ownership"
+            );
+            false
+        }
+    }
+}
+
 /// Three-layer authentication fallback:
 ///   1. Cached session with a valid refresh token (refresh if expired).
 ///   2. `GARMIN_SERVICE_TICKET` env var → exchange for a session.
 ///   3. `GARMIN_EMAIL` + `GARMIN_PASSWORD` (→ MFA if needed) → exchange.
 pub async fn authenticate() -> Result<DiSession> {
-    // Layer 1: cached session.
+    let want_account = configured_account();
+
+    // Layer 1: cached session, but only if it belongs to the configured account.
     if let Ok(session) = load_session() {
-        if session.refresh_is_valid() {
-            if session.is_expired() {
+        if session_matches_account(&session, want_account.as_deref()) {
+            if !session.refresh_is_valid() {
+                eprintln!(
+                    "[di_auth] cached session's refresh token is expired; fresh login needed"
+                );
+            } else if session.is_expired() {
                 eprintln!("[di_auth] cached access token expired; refreshing...");
                 match refresh_di_token(&session).await {
                     Ok(new_session) => {
@@ -546,8 +654,6 @@ pub async fn authenticate() -> Result<DiSession> {
                 eprintln!("[di_auth] using cached DI session (valid)");
                 return Ok(session);
             }
-        } else {
-            eprintln!("[di_auth] cached session's refresh token is expired; fresh login needed");
         }
     }
 
@@ -557,7 +663,8 @@ pub async fn authenticate() -> Result<DiSession> {
         if !ticket.is_empty() {
             eprintln!("[di_auth] exchanging GARMIN_SERVICE_TICKET for DI session...");
             match exchange_service_ticket(ticket).await {
-                Ok(session) => {
+                Ok(mut session) => {
+                    session.account = want_account.clone();
                     save_session(&session)?;
                     return Ok(session);
                 }
@@ -596,8 +703,8 @@ pub async fn authenticate() -> Result<DiSession> {
     };
 
     eprintln!("[di_auth] exchanging service ticket for DI session...");
-    let session = exchange_service_ticket(&ticket).await?;
+    let mut session = exchange_service_ticket(&ticket).await?;
+    session.account = Some(email.trim().to_lowercase());
     save_session(&session)?;
     Ok(session)
 }
-
