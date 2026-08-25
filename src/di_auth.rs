@@ -860,3 +860,160 @@ pub async fn authenticate(client: &rquest::Client) -> Result<DiSession> {
     persist_session(&session);
     Ok(session)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(refresh_token: &str, refresh_expires_at: u64) -> DiSession {
+        DiSession {
+            access_token: "old-access".into(),
+            refresh_token: refresh_token.into(),
+            expires_at: 0,
+            refresh_expires_at,
+            client_id: "CID".into(),
+            account: Some("alice@example.com".into()),
+        }
+    }
+
+    #[test]
+    fn title_is_extracted_case_insensitively_and_trimmed() {
+        assert_eq!(
+            extract_title("<HTML><TITLE>\n  Success \n</TITLE>").as_deref(),
+            Some("Success")
+        );
+        assert_eq!(extract_title("<html>no title</html>"), None);
+    }
+
+    #[test]
+    fn csrf_survives_token_charset_attribute_order_and_quoting() {
+        // The old `(\w+)` pattern failed the whole match on any of these.
+        for html in [
+            r#"<input type="hidden" name="_csrf" value="aB3xY9qR2"/>"#,
+            r#"<input name="_csrf" value="aB3-xY9_qR2="/>"#,
+            r#"<input name="_csrf" type="hidden" value="tok.en-1"/>"#,
+            r#"<input value='tok+en/2=' name='_csrf'/>"#,
+            "<input name=\"_csrf\"\n       value=\"multi-line-tok\"/>",
+        ] {
+            assert!(extract_csrf(html).is_ok(), "should have matched: {html}");
+        }
+
+        assert_eq!(
+            extract_csrf(r#"<input name="_csrf" value="aB3-xY9_qR2="/>"#).unwrap(),
+            "aB3-xY9_qR2="
+        );
+        assert_eq!(
+            extract_csrf(r#"<input value='tok+en/2=' name='_csrf'/>"#).unwrap(),
+            "tok+en/2="
+        );
+    }
+
+    #[test]
+    fn csrf_picks_the_csrf_input_not_a_neighbouring_one() {
+        let html = r#"<input value="DECOY" name="other"><input value="REAL" name="_csrf">"#;
+        assert_eq!(extract_csrf(html).unwrap(), "REAL");
+    }
+
+    #[test]
+    fn csrf_absence_is_an_error_not_an_empty_token() {
+        assert!(extract_csrf("<html><body>nope</body></html>").is_err());
+    }
+
+    #[test]
+    fn ticket_stops_at_every_delimiter_that_can_follow_it() {
+        let cases = [
+            (
+                r#"response_url = "https://sso.garmin.com/sso/embed?ticket=ST-123-abc";"#,
+                "ST-123-abc",
+            ),
+            // Single-quoted JS string: the old `[^"&]+` swallowed the quote and
+            // everything after it up to the next double quote.
+            (
+                r#"response_url = 'https://sso.garmin.com/sso/embed?ticket=ST-123-abc';"#,
+                "ST-123-abc",
+            ),
+            (r#"<a href="/x?foo=1&ticket=ST-7-zz">go</a>"#, "ST-7-zz"),
+            ("var u = ...?ticket=ST-9-x window.location=q", "ST-9-x"),
+        ];
+        for (html, want) in cases {
+            assert_eq!(extract_ticket(html).unwrap(), want, "input: {html}");
+        }
+
+        assert!(extract_ticket("no ticket here").is_err());
+    }
+
+    #[test]
+    fn initial_exchange_still_requires_a_refresh_token() {
+        let body = r#"{"access_token":"a","expires_in":3600}"#;
+        assert!(parse_di_session(body, "CID", None).is_err());
+    }
+
+    #[test]
+    fn refresh_without_a_new_refresh_token_carries_the_old_one_forward() {
+        // RFC 6749 §6 makes refresh_token optional on a refresh.
+        let prev = session("old-refresh", 9_999_999_999);
+        let body = r#"{"access_token":"new-access","expires_in":3600}"#;
+
+        let got = parse_di_session(body, "CID", Some(&prev)).unwrap();
+
+        assert_eq!(got.access_token, "new-access");
+        assert_eq!(got.refresh_token, "old-refresh");
+        // Absent refresh_expires_in must keep the real deadline, not silently
+        // extend the believed window by another 30 days.
+        assert_eq!(got.refresh_expires_at, prev.refresh_expires_at);
+        assert_eq!(got.account.as_deref(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn refresh_honours_a_restated_refresh_expiry() {
+        let prev = session("old-refresh", 10);
+        let body = r#"{"access_token":"a","expires_in":60,"refresh_expires_in":100}"#;
+
+        let got = parse_di_session(body, "CID", Some(&prev)).unwrap();
+
+        assert!(got.refresh_expires_at >= now_secs() + 99);
+        assert!(got.expires_at >= now_secs() + 59);
+    }
+
+    #[test]
+    fn a_rotated_refresh_token_replaces_the_old_one() {
+        let prev = session("old-refresh", 10);
+        let body = r#"{"access_token":"a","refresh_token":"brand-new","expires_in":60}"#;
+
+        let got = parse_di_session(body, "CID", Some(&prev)).unwrap();
+
+        assert_eq!(got.refresh_token, "brand-new");
+        assert!(got.refresh_expires_at >= now_secs() + DEFAULT_REFRESH_TTL_SECS - 1);
+    }
+
+    #[test]
+    fn a_session_file_without_account_still_deserializes() {
+        let legacy = r#"{
+            "access_token":"a","refresh_token":"r",
+            "expires_at":1,"refresh_expires_at":2,"client_id":"CID"
+        }"#;
+        let got: DiSession = serde_json::from_str(legacy).unwrap();
+        assert_eq!(got.account, None);
+    }
+
+    #[test]
+    fn cached_sessions_are_gated_on_the_configured_account() {
+        let mine = session("r", 0);
+
+        // Nothing configured: nothing can contradict the cache.
+        assert!(session_matches_account(&mine, None));
+        // Same account: reuse.
+        assert!(session_matches_account(&mine, Some("alice@example.com")));
+        // Different account: must not serve alice's data as bob.
+        assert!(!session_matches_account(&mine, Some("bob@example.com")));
+
+        // Pre-binding session: ownership unprovable, so reject when an account
+        // is configured but accept when none is.
+        let legacy = DiSession {
+            account: None,
+            ..session("r", 0)
+        };
+        assert!(!session_matches_account(&legacy, Some("alice@example.com")));
+        assert!(session_matches_account(&legacy, None));
+    }
+}

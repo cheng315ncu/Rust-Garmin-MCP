@@ -471,3 +471,70 @@ pub fn render_or_friendly(data: &Value, no_data_msg: &str) -> String {
     }
     serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("Error: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_sorts_params_so_call_order_does_not_split_the_cache() {
+        let mut a = HashMap::new();
+        a.insert("b".to_string(), "2".to_string());
+        a.insert("a".to_string(), "1".to_string());
+
+        assert_eq!(build_cache_key("/x/y", Some(&a)), "x/y?a=1&b=2");
+        assert_eq!(build_cache_key("/x/y", None), "x/y");
+        assert_eq!(build_cache_key("x/y", Some(&HashMap::new())), "x/y");
+    }
+
+    #[test]
+    fn api_url_tolerates_a_leading_slash() {
+        // `connectapi.garmin.com//path` 404s.
+        assert_eq!(api_url("/a/b"), format!("{API_BASE}/a/b"));
+        assert_eq!(api_url("a/b"), format!("{API_BASE}/a/b"));
+    }
+
+    #[test]
+    fn refresh_backoff_grows_then_caps() {
+        assert_eq!(refresh_backoff(1), REFRESH_BACKOFF_MIN);
+        assert_eq!(refresh_backoff(2), REFRESH_BACKOFF_MIN * 2);
+        assert_eq!(refresh_backoff(3), REFRESH_BACKOFF_MIN * 4);
+        assert_eq!(refresh_backoff(99), REFRESH_BACKOFF_MAX);
+        // Never zero — a zero backoff would restore the hot-loop this fixes.
+        assert!(refresh_backoff(0) >= REFRESH_BACKOFF_MIN);
+    }
+
+    #[test]
+    fn garmin_error_envelopes_are_detected() {
+        let http = serde_json::json!({"status": 404, "error": "Not Found", "message": "no data"});
+        assert_eq!(
+            detect_garmin_error(&http).as_deref(),
+            Some("HTTP 404 Not Found: no data")
+        );
+
+        let exc = serde_json::json!({"exception": "NotAllowedException", "errorMessage": "gated"});
+        assert_eq!(
+            detect_garmin_error(&exc).as_deref(),
+            Some("NotAllowedException: gated")
+        );
+
+        // A normal payload must not be mistaken for an error envelope.
+        assert_eq!(
+            detect_garmin_error(&serde_json::json!({"steps": 1200})),
+            None
+        );
+        assert_eq!(
+            detect_garmin_error(&serde_json::json!({"status": 200})),
+            None
+        );
+    }
+
+    #[test]
+    fn render_or_friendly_explains_absence_instead_of_printing_null() {
+        assert_eq!(
+            render_or_friendly(&Value::Null, "no data for 2026-01-01"),
+            "no data for 2026-01-01"
+        );
+        assert!(render_or_friendly(&serde_json::json!({"steps": 1}), "x").contains("\"steps\""));
+    }
+}
