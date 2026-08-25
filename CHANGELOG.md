@@ -18,7 +18,8 @@ TLS-impersonation crate.
 
 - **DI OAuth2 authentication module** (`src/di_auth.rs`): exchanges a Garmin SSO
   service ticket for access/refresh tokens on `diauth.garmin.com`, with token
-  refresh and persistence to `.di_session.json`.
+  refresh and persistence to `.di_session.json`. Garmin currently issues a ~24
+  hour access token and a ~30 day refresh token.
 - **TLS fingerprint impersonation** via `rquest` (Chrome 131 / Android emulation)
   with a cookie store, used for everything behind Cloudflare (`sso.garmin.com`
   HTML login and all `connectapi.garmin.com` API traffic).
