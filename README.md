@@ -227,7 +227,7 @@ Same `"url"`-based shape; consult your client's docs for its remote/HTTP MCP ser
 
 ### ZeroClaw
 
-[ZeroClaw](https://github.com/zeroclaw) agents are configured via a per-instance `config.toml`. Point the `[[mcp.servers]]` block at the daemon's URL, then bundle it and grant it to an agent:
+[ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw.git) agents are configured via a per-instance `config.toml`. Point the `[[mcp.servers]]` block at the daemon's URL, then bundle it and grant it to an agent:
 
 ```toml
 [[mcp.servers]]
