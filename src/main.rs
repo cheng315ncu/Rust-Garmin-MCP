@@ -1,5 +1,7 @@
 use garmin_mcp::auth;
-use rmcp::{transport::stdio, ServiceExt};
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpService,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -10,16 +12,27 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("Garmin MCP (Rust) starting...");
 
+    // One authenticated client for the process lifetime — GarminMcpServer is
+    // Clone (cheap: shares the same Arc<RwLock<DiSession>> and http client),
+    // so every HTTP session reuses this login instead of re-authenticating.
     let server = auth::create_garmin_server().await?;
 
-    eprintln!("Authenticated. Starting MCP server on stdio...");
+    let port: u16 = std::env::var("GARMIN_MCP_HTTP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8210);
 
-    let service = server
-        .serve(stdio())
-        .await
-        .inspect_err(|e| eprintln!("Server startup error: {e}"))?;
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
 
-    service.waiting().await?;
+    eprintln!("Authenticated. Serving MCP over HTTP on http://127.0.0.1:{port}/mcp");
+
+    axum::serve(listener, router).await?;
 
     Ok(())
 }
