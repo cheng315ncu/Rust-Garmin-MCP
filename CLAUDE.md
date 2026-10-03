@@ -164,6 +164,14 @@ message style: say *why* the data is absent (device not worn, feature not enable
 user-facing strings in `client.rs` are Traditional Chinese — match surrounding language when
 editing those lines.
 
+**Range tools and activities must fail loudly.** `research.rs` (`get_*_range`, `get_weekly_summary`)
+and `activities_by_date` return an `Error …` string when an `api_json` call fails; a date-only row or
+"No activities found" means Garmin answered with no data. Never swallow the `Err` (`if let Ok`,
+`_ => break`): Rust-Health-DB parses these outputs (the three CSV headers, `Range spans`, `No
+activities found between`) and `INSERT OR REPLACE`s date-only rows over stored data.
+`tests/fetch_failure.rs` pins this offline. Treat those strings and headers as a contract with
+`../Rust-Health-DB/src/ingest.rs`.
+
 Tools needing `display_name` must start with `api.require_display_name()` and early-return its
 `Err` string.
 

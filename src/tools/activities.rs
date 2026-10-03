@@ -34,7 +34,12 @@ pub async fn activities_by_date(
                 all.extend(arr);
                 start += limit;
             }
-            _ => break,
+            Ok(_) => break,
+            Err(e) => {
+                return format!(
+                    "Error retrieving activities between {start_date} and {end_date}: {e}"
+                );
+            }
         }
     }
 

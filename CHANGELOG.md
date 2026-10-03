@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `get_daily_stats_range`, `get_sleep_range`, `get_hrv_range`, `get_weekly_summary` and
+  `get_activities_by_date` now return an error when a Garmin request fails, instead of rendering
+  the failed day as an empty "no data" row. Downstream caches such as Rust-Health-DB stored those
+  rows over good data.
+
 ## [0.2.0] - 2026-08-25
 
 In March 2026 Garmin enabled Cloudflare TLS fingerprinting on `sso.garmin.com`

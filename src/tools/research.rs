@@ -231,13 +231,15 @@ pub async fn daily_stats_range(
         let endpoint = format!("/usersummary-service/usersummary/daily/{}", display_name);
         let params = HashMap::from([("calendarDate".to_string(), date_str)]);
 
-        if let Ok(data) = api.api_json(&endpoint, Some(params)).await {
-            if !data.is_null() && crate::client::detect_garmin_error(&data).is_none() {
-                for &(src, dst) in STATS_API_FIELDS {
-                    if let Some(v) = data.get(src) {
-                        if !v.is_null() {
-                            row.insert(dst.to_string(), v.clone());
-                        }
+        let data = match api.api_json(&endpoint, Some(params)).await {
+            Ok(data) => data,
+            Err(e) => return format!("Error fetching daily stats for {date}: {e}"),
+        };
+        if !data.is_null() && crate::client::detect_garmin_error(&data).is_none() {
+            for &(src, dst) in STATS_API_FIELDS {
+                if let Some(v) = data.get(src) {
+                    if !v.is_null() {
+                        row.insert(dst.to_string(), v.clone());
                     }
                 }
             }
@@ -282,14 +284,16 @@ pub async fn sleep_range(
             ("nonSleepBufferMinutes".to_string(), "60".to_string()),
         ]);
 
-        if let Ok(data) = api.api_json(&endpoint, Some(params)).await {
-            let dto = data.get("dailySleepDTO").unwrap_or(&data);
-            if !dto.is_null() {
-                for &(src, dst) in SLEEP_API_FIELDS {
-                    if let Some(v) = dto.get(src) {
-                        if !v.is_null() {
-                            row.insert(dst.to_string(), v.clone());
-                        }
+        let data = match api.api_json(&endpoint, Some(params)).await {
+            Ok(data) => data,
+            Err(e) => return format!("Error fetching sleep for {date}: {e}"),
+        };
+        let dto = data.get("dailySleepDTO").unwrap_or(&data);
+        if !dto.is_null() {
+            for &(src, dst) in SLEEP_API_FIELDS {
+                if let Some(v) = dto.get(src) {
+                    if !v.is_null() {
+                        row.insert(dst.to_string(), v.clone());
                     }
                 }
             }
@@ -322,13 +326,15 @@ pub async fn hrv_range(api: &GarminApiClient, start: &str, end: &str, fmt: Outpu
 
         let endpoint = format!("/hrv-service/hrv/{}", date_str);
 
-        if let Ok(data) = api.api_json(&endpoint, None).await {
-            if let Some(Value::Object(summary)) = data.get("hrvSummary") {
-                for &(src, dst) in HRV_API_FIELDS {
-                    if let Some(v) = summary.get(src) {
-                        if !v.is_null() {
-                            row.insert(dst.to_string(), v.clone());
-                        }
+        let data = match api.api_json(&endpoint, None).await {
+            Ok(data) => data,
+            Err(e) => return format!("Error fetching HRV for {date}: {e}"),
+        };
+        if let Some(Value::Object(summary)) = data.get("hrvSummary") {
+            for &(src, dst) in HRV_API_FIELDS {
+                if let Some(v) = summary.get(src) {
+                    if !v.is_null() {
+                        row.insert(dst.to_string(), v.clone());
                     }
                 }
             }
@@ -366,13 +372,15 @@ pub async fn weekly_summary(api: &GarminApiClient, start: &str, end: &str) -> St
         let endpoint = format!("/usersummary-service/usersummary/daily/{}", display_name);
         let params = HashMap::from([("calendarDate".to_string(), date_str)]);
 
-        if let Ok(data) = api.api_json(&endpoint, Some(params)).await {
-            if !data.is_null() && crate::client::detect_garmin_error(&data).is_none() {
-                for &(src, dst) in STATS_API_FIELDS {
-                    if let Some(v) = data.get(src) {
-                        if !v.is_null() {
-                            row.insert(dst.to_string(), v.clone());
-                        }
+        let data = match api.api_json(&endpoint, Some(params)).await {
+            Ok(data) => data,
+            Err(e) => return format!("Error fetching daily stats for {date}: {e}"),
+        };
+        if !data.is_null() && crate::client::detect_garmin_error(&data).is_none() {
+            for &(src, dst) in STATS_API_FIELDS {
+                if let Some(v) = data.get(src) {
+                    if !v.is_null() {
+                        row.insert(dst.to_string(), v.clone());
                     }
                 }
             }
