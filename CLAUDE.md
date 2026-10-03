@@ -178,6 +178,37 @@ deliberately-unfilled slot in this trait; the module doc explains why.
 (`MAX_DAYS = 366`), emits date-only rows for days with no data so the series is never truncated,
 and has its own CSV helpers.
 
+## Deferred cleanups
+
+Recorded 2026-09-30 after a repo-wide pass over complexity only (no bugs, no security issues, no
+dependency to drop). Do not open a refactor just to cut lines.
+
+### Leave alone
+
+- Keep the tool split above. Domain functions each have one `#[tool]` caller on purpose; inlining
+  them into `mod.rs` only makes the router own endpoint logic.
+- Keep `api_put_json` and the `PUT` arm of `api_write`. Nothing calls it (`#[allow(dead_code)]`);
+  it stays on the public contract above.
+- Keep the EDF notes in `src/tools/output.rs` and the README. The trait slot is empty on purpose;
+  the notes say why.
+
+### Only while already editing that file
+
+- `src/tools/research.rs`: `STATS_COLS`, `SLEEP_COLS`, and `HRV_COLS` repeat the destination names
+  of the matching `*_API_FIELDS`. `value_to_csv_cell` and `csv_quote` duplicate the private helpers
+  in `output.rs`. On the next change to research CSV output, derive the columns from the field
+  pairs and call the `output.rs` helpers. Column order must stay the same.
+- A shared dump helper for the pure GET-and-print tools (path in, pretty JSON or
+  `render_or_friendly` out; about thirty functions across `activities`, `devices`, `challenges`,
+  `health_wellness`, `nutrition`, `training`, `user_profile`, `womens_health`, `workouts`). Extract
+  it when adding another endpoint of that shape. Error strings are user-facing; do not move path
+  strings in a drive-by.
+- Leave `GetWorkoutsParams` / `AdhocChallengesParams` and `GetActivitiesByDateParams` /
+  `GetProgressSummaryParams` as separate structs. The fields match; the schema descriptions do not.
+  Merging them changes what MCP clients see.
+- `dotenvy::dotenv()` runs in both `main.rs` and `create_garmin_client`. Harmless. The call in
+  `auth.rs` stays so tests and library callers load `.env` without going through `main`.
+
 ## Environment
 
 `GARMIN_EMAIL` / `GARMIN_PASSWORD` (each also accepts a `_FILE` variant pointing at a file
