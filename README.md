@@ -1,5 +1,9 @@
 # Garmin MCP Server (Rust)
 
+> **This project will no longer be maintained.** Development is moving to a new platform that can take health data from more than one device. This repository stays available for existing installs. No further features or fixes are planned here.
+>
+> **本專案之後不再維護。** 後續會改到新的平台，讓一份服務可以接多台裝置。這裡保留給已經在用的人，不再加功能或修補。
+
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that connects Claude and other MCP clients to Garmin Connect, exposing your fitness and health data through **77 tools** across all major Garmin Connect features.
 
 Written in Rust for a single-binary deployment with no runtime dependencies.
